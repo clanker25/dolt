@@ -1,0 +1,252 @@
+// Copyright 2019 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package diff
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+
+	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/store/prolly"
+	"github.com/dolthub/dolt/go/store/prolly/tree"
+	"github.com/dolthub/dolt/go/store/val"
+)
+
+var ErrPrimaryKeySetChanged = errors.New("primary key set changed")
+
+type DiffStatProgress struct {
+	Adds, Removes, Changes, CellChanges, NewRowSize, OldRowSize, NewCellSize, OldCellSize uint64
+}
+
+type prollyReporter func(ctx context.Context, vMapping val.OrdinalMapping, fromD, toD *val.TupleDesc, change tree.Diff, ch chan<- DiffStatProgress) error
+
+// Stat reports a stat of diff changes between two values
+// todo: make package private once dolthub is migrated
+func Stat(ctx context.Context, ch chan DiffStatProgress, from, to durable.Index, fromSch, toSch schema.Schema) (err error) {
+	fc, err := from.Count()
+	if err != nil {
+		return err
+	}
+	tc, err := to.Count()
+	if err != nil {
+		return err
+	}
+	ch <- DiffStatProgress{OldRowSize: fc, NewRowSize: tc}
+
+	fk, tk := schema.IsKeyless(fromSch), schema.IsKeyless(toSch)
+	var keyless bool
+	if fk && tk {
+		keyless = true
+	} else if fk != tk {
+		return fmt.Errorf("cannot perform a diff between keyless and keyed schema")
+	}
+
+	return diffProllyTrees(ctx, ch, keyless, from, to, fromSch, toSch)
+}
+
+// StatForTableDelta pushes diff stat progress messages for the table delta given to the channel given
+func StatForTableDelta(ctx context.Context, ch chan DiffStatProgress, td TableDelta) error {
+	// Check for root objects first, as they're handled differently
+	if td.FromRootObject != nil && td.ToRootObject != nil {
+		ch <- DiffStatProgress{Changes: 1}
+		return nil
+	} else if td.FromRootObject == nil && td.ToRootObject != nil {
+		ch <- DiffStatProgress{Adds: 1}
+		return nil
+	} else if td.FromRootObject != nil && td.ToRootObject == nil {
+		ch <- DiffStatProgress{Removes: 1}
+		return nil
+	}
+
+	fromSch, toSch, err := td.GetSchemas(ctx)
+	if err != nil {
+		return errhand.BuildDError("cannot retrieve schema for table %s", td.ToName).AddCause(err).Build()
+	}
+
+	if schema.ComparePrimaryKeys(fromSch, toSch) == schema.PrimaryKeysDiffer {
+		return fmt.Errorf("failed to compute diff stat for table %s: %w", td.CurName(), ErrPrimaryKeySetChanged)
+	}
+
+	keyless, err := td.IsKeyless(ctx)
+	if err != nil {
+		return err
+	}
+
+	fromRows, toRows, err := td.GetRowData(ctx)
+	if err != nil {
+		return err
+	}
+
+	return diffProllyTrees(ctx, ch, keyless, fromRows, toRows, fromSch, toSch)
+}
+
+func diffProllyTrees(ctx context.Context, ch chan DiffStatProgress, keyless bool, from, to durable.Index, fromSch, toSch schema.Schema) error {
+	_, vMapping, err := schema.MapSchemaBasedOnTagAndName(fromSch, toSch)
+	if err != nil {
+		return err
+	}
+
+	var f, t prolly.Map
+	if from != nil {
+		f, err = durable.ProllyMapFromIndex(from)
+		if err != nil {
+			return err
+		}
+	}
+	if to != nil {
+		t, err = durable.ProllyMapFromIndex(to)
+		if err != nil {
+			return err
+		}
+	}
+
+	_, fVD := f.Descriptors()
+	_, tVD := t.Descriptors()
+
+	var rpr prollyReporter
+	if keyless {
+		rpr = reportKeylessChanges
+	} else {
+		var fc uint64
+		if from != nil {
+			fc, err = from.Count()
+			if err != nil {
+				return err
+			}
+		}
+
+		cfc := uint64(len(fromSch.GetAllCols().GetColumns())) * fc
+		var tc uint64
+		if to != nil {
+			tc, err = to.Count()
+			if err != nil {
+				return err
+			}
+		}
+
+		ctc := uint64(len(toSch.GetAllCols().GetColumns())) * tc
+		rpr = reportPkChanges
+		ch <- DiffStatProgress{
+			OldRowSize:  fc,
+			NewRowSize:  tc,
+			OldCellSize: cfc,
+			NewCellSize: ctc,
+		}
+	}
+
+	// TODO: Use `vMapping` to determine whether columns have been added or removed. If so, then all rows should
+	// count as modifications in the diff.
+	considerAllRowsModified := false
+	err = prolly.DiffMaps(ctx, f, t, considerAllRowsModified, func(ctx context.Context, diff tree.Diff) error {
+		return rpr(ctx, vMapping, fVD, tVD, diff, ch)
+	})
+	if err != nil && err != io.EOF {
+		return err
+	}
+	return nil
+}
+
+func reportPkChanges(ctx context.Context, vMapping val.OrdinalMapping, fromD, toD *val.TupleDesc, change tree.Diff, ch chan<- DiffStatProgress) error {
+	var stat DiffStatProgress
+	switch change.Type {
+	case tree.AddedDiff:
+		stat.Adds++
+	case tree.RemovedDiff:
+		stat.Removes++
+	case tree.ModifiedDiff:
+		cellChanges, err := prollyCountCellDiff(ctx, vMapping, fromD, toD, val.Tuple(change.From), val.Tuple(change.To))
+		if err != nil {
+			return err
+		}
+		stat.CellChanges = cellChanges
+		stat.Changes++
+	default:
+		return errors.New("unknown change type")
+	}
+	select {
+	case ch <- stat:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func reportKeylessChanges(ctx context.Context, vMapping val.OrdinalMapping, fromD, toD *val.TupleDesc, change tree.Diff, ch chan<- DiffStatProgress) error {
+	var stat DiffStatProgress
+	var n, n2 uint64
+	switch change.Type {
+	case tree.AddedDiff:
+		n, _ = toD.GetUint64(0, val.Tuple(change.To))
+		stat.Adds += n
+	case tree.RemovedDiff:
+		n, _ = fromD.GetUint64(0, val.Tuple(change.From))
+		stat.Removes += n
+	case tree.ModifiedDiff:
+		n, _ = fromD.GetUint64(0, val.Tuple(change.From))
+		n2, _ = toD.GetUint64(0, val.Tuple(change.To))
+		if n < n2 {
+			stat.Adds += n2 - n
+		} else {
+			stat.Removes += n - n2
+		}
+	default:
+		return errors.New("unknown change type")
+	}
+	select {
+	case ch <- stat:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// prollyCountCellDiff counts the number of changes columns between two tuples
+// |from| and |to|. |mapping| should map columns from |from| to |to|.
+func prollyCountCellDiff(ctx context.Context, mapping val.OrdinalMapping, fromD, toD *val.TupleDesc, from, to val.Tuple) (uint64, error) {
+	newCols := uint64(toD.Count())
+	changed := uint64(0)
+	for i, j := range mapping {
+		newCols--
+		if j == -1 {
+			// column was dropped
+			changed++
+			continue
+		}
+
+		if fromD.Types[i].Enc != toD.Types[j].Enc {
+			// column type is different
+			changed++
+			continue
+		}
+
+		cmp, err := fromD.CompareField(ctx, toD.GetField(j, to), i, from)
+		if err != nil {
+			return 0, err
+		}
+		if cmp != 0 {
+			// column was modified
+			changed++
+			continue
+		}
+	}
+
+	// some columns were added
+	changed += newCols
+	return changed, nil
+}

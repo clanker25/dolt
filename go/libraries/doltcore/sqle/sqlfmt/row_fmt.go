@@ -1,0 +1,438 @@
+// Copyright 2020 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sqlfmt
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"strings"
+
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/vitess/go/sqltypes"
+	querypb "github.com/dolthub/vitess/go/vt/proto/query"
+	"github.com/dolthub/vitess/go/vt/sqlparser"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema/typeinfo"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/overrides"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
+	"github.com/dolthub/dolt/go/libraries/utils/set"
+	"github.com/dolthub/dolt/go/store/types"
+)
+
+const singleQuote = `'`
+
+// QuoteIdentifier quotes the identifier given with backticks.
+func QuoteIdentifier(ctx *sql.Context, s string) string {
+	formatter := overrides.SchemaFormatterFromContext(ctx)
+	return formatter.QuoteIdentifier(s)
+}
+
+// QuoteTableName quotes the table name given with backticks.
+func QuoteTableName(n doltdb.TableName) string {
+	// TODO: quote character is different for different SQL modes / dialects
+	return "`" + n.String() + "`"
+}
+
+// QuoteComment quotes the given string with apostrophes, and escapes any contained within the string.
+func QuoteComment(s string) string {
+	return `'` + strings.ReplaceAll(s, `'`, `\'`) + `'`
+}
+
+// InsertStatementPrefix returns the first part of an INSERT statement
+// for |tableName|, up to and including VALUES:
+//
+//	INSERT INTO `t` (`id`,`a`) VALUES
+//
+// Generated columns are skipped here while building the column list.
+// The caller appends one tuple of values per row, along with the
+// closing semicolon. See SqlRowAsTupleString.
+func InsertStatementPrefix(ctx *sql.Context, tableName string, tableSch schema.Schema) (string, error) {
+	var b strings.Builder
+
+	b.WriteString("INSERT INTO ")
+	b.WriteString(QuoteIdentifier(ctx, tableName))
+	b.WriteString(" (")
+
+	seenOne := false
+	err := tableSch.GetAllCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
+		if col.IsGenerated() {
+			return false, nil
+		}
+		if seenOne {
+			b.WriteRune(',')
+		}
+		b.WriteString(QuoteIdentifier(ctx, col.Name))
+		seenOne = true
+		return false, nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	b.WriteString(") VALUES ")
+	return b.String(), nil
+}
+
+// SqlRowAsCreateProcStmt Converts a Row into either a CREATE PROCEDURE statement
+// This function expects a row from the dolt_procedures table.
+func SqlRowAsCreateProcStmt(ctx *sql.Context, r sql.Row) (string, error) {
+	var b strings.Builder
+
+	// Write create procedure
+	prefix := "CREATE PROCEDURE "
+	b.WriteString(prefix)
+
+	// Write procedure name
+	nameStr := r[0].(string)
+	b.WriteString(QuoteIdentifier(ctx, nameStr))
+	b.WriteString(" ") // add a space
+
+	// Write definition
+	defStmt, err := sqlparser.Parse(r[1].(string))
+	if err != nil {
+		return "", err
+	}
+	defStr := sqlparser.String(defStmt)
+	defStr = defStr[len(prefix)+len(nameStr)+1:]
+	b.WriteString(defStr)
+
+	b.WriteString(";")
+	return b.String(), nil
+}
+
+// SqlRowAsCreateFragStmt Converts a Row into either a CREATE TRIGGER or CREATE VIEW statement
+// This function expects a row from the dolt_schemas table
+func SqlRowAsCreateFragStmt(ctx *sql.Context, r sql.Row) (string, error) {
+	var b strings.Builder
+
+	// If type is view, add DROP VIEW IF EXISTS statement before CREATE VIEW STATEMENT
+	typeStr := strings.ToUpper(r[0].(string))
+	if typeStr == "VIEW" {
+		nameStr := r[1].(string)
+		dropStmt := fmt.Sprintf("DROP VIEW IF EXISTS `%s`", nameStr)
+		b.WriteString(dropStmt)
+		b.WriteString(";\n")
+	}
+
+	// Parse statement to extract definition (and remove any weird whitespace issues)
+	defStmt, err := sqlparser.Parse(r[2].(string))
+	if err != nil {
+		return "", err
+	}
+
+	defStr := sqlparser.String(defStmt)
+
+	// TODO: this is temporary fix for create statements
+	if typeStr == "TRIGGER" {
+		nameStr := r[1].(string)
+		defStr = fmt.Sprintf("CREATE TRIGGER `%s` %s", nameStr, defStr[len("CREATE TRIGGER ")+len(nameStr)+1:])
+	} else {
+		defStr = strings.Replace(defStr, "create ", "CREATE ", -1)
+		defStr = strings.Replace(defStr, " view ", " VIEW ", -1)
+		defStr = strings.Replace(defStr, " as ", " AS ", -1)
+	}
+
+	b.WriteString(defStr)
+
+	b.WriteString(";")
+	return b.String(), nil
+}
+
+func SqlRowAsInsertStmt(ctx *sql.Context, r sql.Row, tableName string, tableSch schema.Schema) (string, error) {
+	var b strings.Builder
+
+	// Write insert prefix
+	prefix, err := InsertStatementPrefix(ctx, tableName, tableSch)
+	if err != nil {
+		return "", err
+	}
+	b.WriteString(prefix)
+
+	// Write single insert
+	str, err := SqlRowAsTupleString(ctx, r, tableSch)
+	if err != nil {
+		return "", err
+	}
+	b.WriteString(str)
+
+	b.WriteString(";")
+	return b.String(), nil
+}
+
+// SqlRowAsTupleString converts |r| into its tuple string
+// representation for INSERT statements, for example (1,'x',NULL).
+//
+// Values for generated columns are left out so that the tuple matches
+// the column list from InsertStatementPrefix.
+//
+// |r| must hold one value per column of |tableSch|, in schema order.
+// A row of any other width is an error because its values would be
+// written against the wrong columns.
+func SqlRowAsTupleString(ctx *sql.Context, r sql.Row, tableSch schema.Schema) (string, error) {
+	var b strings.Builder
+	var err error
+
+	cols := tableSch.GetAllCols()
+	if len(r) != cols.Size() {
+		return "", fmt.Errorf("expected %d values for table schema, got %d", cols.Size(), len(r))
+	}
+
+	b.WriteString("(")
+	seenOne := false
+	for i, val := range r {
+		col := cols.GetByIndex(i)
+		if col.IsGenerated() {
+			continue
+		}
+		if seenOne {
+			b.WriteRune(',')
+		}
+		str := "NULL"
+		if val != nil {
+			str, err = interfaceValueAsSqlString(ctx, col.TypeInfo, val)
+			if err != nil {
+				return "", err
+			}
+		}
+
+		b.WriteString(str)
+		seenOne = true
+	}
+	b.WriteString(")")
+
+	return b.String(), nil
+}
+
+// SqlRowAsStrings returns the string representation for each column of |r|
+// which should have schema |sch|.
+func SqlRowAsStrings(ctx *sql.Context, r sql.Row, sch sql.Schema) ([]string, error) {
+	out := make([]string, len(r))
+	for i := range out {
+		v := r[i]
+		sqlType := sch[i].Type
+		s, err := sqlutil.SqlColToStr(ctx, sqlType, v)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = s
+	}
+	return out, nil
+}
+
+// SqlRowAsDeleteStmt generates a sql statement. Non-zero |limit| adds a limit clause.
+func SqlRowAsDeleteStmt(ctx *sql.Context, r sql.Row, tableName string, tableSch schema.Schema, limit uint64) (string, error) {
+	var b strings.Builder
+	b.WriteString("DELETE FROM ")
+	b.WriteString(QuoteIdentifier(ctx, tableName))
+
+	b.WriteString(" WHERE ")
+	seenOne := false
+	i := 0
+	isKeyless := schema.IsKeyless(tableSch)
+
+	err := tableSch.GetAllCols().Iter(func(_ uint64, col schema.Column) (stop bool, err error) {
+		if col.IsPartOfPK || isKeyless {
+			if seenOne {
+				b.WriteString(" AND ")
+			}
+			sqlString, err := interfaceValueAsSqlString(ctx, col.TypeInfo, r[i])
+			if err != nil {
+				return true, err
+			}
+			b.WriteString(QuoteIdentifier(ctx, col.Name))
+			b.WriteRune('=')
+			b.WriteString(sqlString)
+			seenOne = true
+		}
+		i++
+		return false, nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	if limit != 0 {
+		b.WriteString(" LIMIT ")
+		s, err := interfaceValueAsSqlString(ctx, typeinfo.FromKind(types.UintKind), limit)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(s)
+	}
+
+	b.WriteString(";")
+	return b.String(), nil
+}
+
+// SqlRowAsUpdateStmt generates an UPDATE statement setting the
+// columns of |r| named by |colsToUpdate|.
+//
+// Generated columns are skipped. If no columns remain to update,
+// an empty string is returned.
+//
+// The row to change is keyed by the primary key columns of
+// |tableSch|, using their values from |r|.
+func SqlRowAsUpdateStmt(ctx *sql.Context, r sql.Row, tableName string, tableSch schema.Schema, colsToUpdate *set.StrSet) (string, error) {
+	var b strings.Builder
+	b.WriteString("UPDATE ")
+	b.WriteString(QuoteIdentifier(ctx, tableName))
+	b.WriteString(" ")
+
+	b.WriteString("SET ")
+
+	i := 0
+	seenOne := false
+	err := tableSch.GetAllCols().Iter(func(_ uint64, col schema.Column) (stop bool, err error) {
+		if colsToUpdate.Contains(col.Name) && !col.IsGenerated() {
+			if seenOne {
+				b.WriteRune(',')
+			}
+			seenOne = true
+
+			sqlString, err := interfaceValueAsSqlString(ctx, col.TypeInfo, r[i])
+			if err != nil {
+				return true, err
+			}
+			b.WriteString(QuoteIdentifier(ctx, col.Name))
+			b.WriteRune('=')
+			b.WriteString(sqlString)
+		}
+		i++
+		return false, nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	if !seenOne {
+		return "", nil
+	}
+
+	b.WriteString(" WHERE ")
+
+	i = 0
+	seenOne = false
+	err = tableSch.GetAllCols().Iter(func(_ uint64, col schema.Column) (stop bool, err error) {
+		if col.IsPartOfPK {
+			if seenOne {
+				b.WriteString(" AND ")
+			}
+			seenOne = true
+
+			sqlString, err := interfaceValueAsSqlString(ctx, col.TypeInfo, r[i])
+			if err != nil {
+				return true, err
+			}
+			b.WriteString(QuoteIdentifier(ctx, col.Name))
+			b.WriteRune('=')
+			b.WriteString(sqlString)
+		}
+		i++
+		return false, nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	b.WriteString(";")
+	return b.String(), nil
+}
+
+func interfaceValueAsSqlString(ctx *sql.Context, ti typeinfo.TypeInfo, value interface{}) (string, error) {
+	if value == nil {
+		return "NULL", nil
+	}
+
+	sqlType := ti.ToSqlType()
+	str, err := sqlutil.SqlColToStr(ctx, sqlType, value)
+	if err != nil {
+		return "", err
+	}
+
+	switch sqlType.Type() {
+	case querypb.Type_UINT8:
+		switch v := value.(type) {
+		case uint8:
+			return fmt.Sprintf("%d", v), nil
+		case int8:
+			return fmt.Sprintf("%d", uint8(v)), nil
+		case bool:
+			if v {
+				return "1", nil
+			}
+			return "0", nil
+		default:
+			return str, nil
+		}
+	case querypb.Type_TIME, querypb.Type_YEAR, querypb.Type_DATETIME, querypb.Type_TIMESTAMP, querypb.Type_DATE:
+		return singleQuote + str + singleQuote, nil
+	case querypb.Type_BINARY, querypb.Type_VARBINARY, querypb.Type_VECTOR:
+		value, err := sql.UnwrapAny(ctx, value)
+		if err != nil {
+			return "", err
+		}
+		switch v := value.(type) {
+		case []byte:
+			return hexEncodeBytes(v), nil
+		case string:
+			return hexEncodeBytes([]byte(v)), nil
+		default:
+			return "", fmt.Errorf("unexpected type for binary value: %T (SQL type info: %v)", value, ti)
+		}
+	case querypb.Type_TEXT:
+		value, ok, err := sql.Unwrap[string](ctx, value)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return quoteAndEscapeString(value), nil
+		}
+		// Fall back to the pre-computed string representation from SqlColToStr.
+		return quoteAndEscapeString(str), nil
+	case querypb.Type_JSON, querypb.Type_ENUM, querypb.Type_SET, querypb.Type_BLOB:
+		return quoteAndEscapeString(str), nil
+	case querypb.Type_VARCHAR, querypb.Type_CHAR:
+		s, ok := value.(string)
+		if !ok {
+			return "", fmt.Errorf("expected string, got %T", value)
+		}
+		return quoteAndEscapeString(s), nil
+	case querypb.Type_GEOMETRY:
+		return singleQuote + str + singleQuote, nil
+	default:
+		return str, nil
+	}
+}
+
+func quoteAndEscapeString(s string) string {
+	buf := &bytes.Buffer{}
+	v, err := sqltypes.NewValue(sqltypes.VarChar, []byte(s))
+	if err != nil {
+		panic(err)
+	}
+	v.EncodeSQL(buf)
+	return buf.String()
+}
+
+func hexEncodeBytes(bytes []byte) string {
+	return "0x" + hex.EncodeToString(bytes)
+}

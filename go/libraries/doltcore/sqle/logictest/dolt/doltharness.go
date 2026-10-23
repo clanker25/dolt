@@ -1,0 +1,335 @@
+// Copyright 2019 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package dolt
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"math/rand"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/cockroachdb/apd/v3"
+	sqle "github.com/dolthub/go-mysql-server"
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/analyzer"
+	"github.com/dolthub/sqllogictest/go/logictest"
+	"github.com/dolthub/vitess/go/vt/proto/query"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/gcctx"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	dsql "github.com/dolthub/dolt/go/libraries/doltcore/sqle"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statspro"
+	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
+	"github.com/dolthub/dolt/go/libraries/utils/filesys"
+	"github.com/dolthub/dolt/go/store/types"
+)
+
+var _ logictest.Harness = &DoltHarness{}
+
+const (
+	name  = "sqllogictest runner"
+	email = "sqllogictestrunner@dolthub.com"
+)
+
+type DoltHarness struct {
+	engine  *sqle.Engine
+	sess    *dsess.DoltSession
+	Version string
+}
+
+func (h *DoltHarness) Close() {
+	dbs := h.sess.Provider().AllDatabases(sql.NewContextWithVariables(context.Background(), h.engine.Variables(), sql.WithSession(h.sess)))
+	for _, db := range dbs {
+		// Close the sql-layer database resources (global state, background threads, etc).
+		// Do NOT close the underlying DoltDB here; this harness reuses a shared *env.DoltEnv
+		// across multiple init/teardown cycles (see doltharness_test.go).
+		db.(dsess.SqlDatabase).Close()
+	}
+}
+
+func (h *DoltHarness) EngineStr() string {
+	return "mysql"
+}
+
+func (h *DoltHarness) Init() error {
+	dEnv := env.Load(context.Background(), env.GetCurrentUserHomeDir, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
+	return innerInit(h, dEnv)
+}
+
+func (h *DoltHarness) ExecuteStatement(statement string) error {
+	return h.ExecuteStatementContext(context.Background(), statement)
+}
+
+func (h *DoltHarness) ExecuteQuery(statement string) (schema string, results []string, err error) {
+	return h.ExecuteQueryContext(context.Background(), statement)
+}
+
+func (h *DoltHarness) ExecuteStatementContext(ctx context.Context, statement string) error {
+	sqlCtx := sql.NewContext(
+		ctx,
+		sql.WithPid(rand.Uint64()),
+		sql.WithSession(h.sess))
+
+	_, rowIter, _, err := h.engine.Query(sqlCtx, statement)
+	if err != nil {
+		return err
+	}
+
+	return drainIterator(sqlCtx, rowIter)
+}
+
+func (h *DoltHarness) ExecuteQueryContext(ctx context.Context, statement string) (schema string, results []string, err error) {
+	pid := rand.Uint32()
+	sqlCtx := sql.NewContext(
+		ctx,
+		sql.WithPid(uint64(pid)),
+		sql.WithSession(h.sess))
+
+	var sch sql.Schema
+	var rowIter sql.RowIter
+	defer func() {
+		if r := recover(); r != nil {
+			// Panics leave the engine in a bad state that we have to clean up
+			h.engine.ProcessList.Kill(pid)
+			panic(r)
+		}
+	}()
+
+	sch, rowIter, _, err = h.engine.Query(sqlCtx, statement)
+	if err != nil {
+		return "", nil, err
+	}
+
+	schemaString, err := schemaToSchemaString(sch)
+	if err != nil {
+		return "", nil, err
+	}
+
+	results, err = rowsToResultStrings(sqlCtx, rowIter)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return schemaString, results, nil
+}
+
+func (h *DoltHarness) GetTimeout() int64 {
+	return 0
+}
+
+func innerInit(h *DoltHarness, dEnv *env.DoltEnv) error {
+	ctx := context.Background()
+	if !dEnv.HasDoltDir() {
+		err := dEnv.InitRepoWithTime(context.Background(), types.Format_DOLT, name, email, env.DefaultInitBranch, time.Now())
+		if err != nil {
+			return err
+		}
+	} else {
+		err := dEnv.InitDBAndRepoState(context.Background(), types.Format_DOLT, name, email, env.DefaultInitBranch, time.Now())
+		if err != nil {
+			return err
+		}
+	}
+
+	var err error
+	var pro dsess.DoltDatabaseProvider
+	vars := dsql.NewEngineVariables()
+	h.engine, pro, err = sqlNewEngine(ctx, dEnv, vars)
+
+	if err != nil {
+		return err
+	}
+
+	gcSafepointController := gcctx.NewGCSafepointController()
+
+	config, _ := dEnv.Config.GetConfig(env.GlobalConfig)
+	sqlCtx := dsql.NewTestSQLCtxWithProvider(ctx, pro, config, statspro.StatsNoop{}, gcSafepointController, vars)
+	h.sess = sqlCtx.Session.(*dsess.DoltSession)
+
+	dbs := h.engine.Analyzer.Catalog.AllDatabases(sqlCtx)
+	var dbName string
+	for _, db := range dbs {
+		dsqlDB, ok := db.(dsql.Database)
+		if !ok {
+			continue
+		}
+		dbName = dsqlDB.Name()
+		break
+	}
+
+	h.sess.SetCurrentDatabase(dbName)
+
+	return nil
+}
+
+func drainIterator(ctx *sql.Context, iter sql.RowIter) error {
+	if iter == nil {
+		return nil
+	}
+
+	for {
+		_, err := iter.Next(ctx)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+	}
+
+	return iter.Close(ctx)
+}
+
+// This shouldn't be necessary -- the fact that an iterator can return an error but not clean up after itself in all
+// cases is a bug.
+func drainIteratorIgnoreErrors(ctx *sql.Context, iter sql.RowIter) {
+	if iter == nil {
+		return
+	}
+
+	for {
+		_, err := iter.Next(ctx)
+		if err == io.EOF {
+			return
+		}
+	}
+}
+
+// Returns the rows in the iterator given as an array of their string representations, as expected by the test files
+func rowsToResultStrings(ctx *sql.Context, iter sql.RowIter) ([]string, error) {
+	var results []string
+	if iter == nil {
+		return results, nil
+	}
+
+	for {
+		row, err := iter.Next(ctx)
+		if err == io.EOF {
+			return results, nil
+		} else if err != nil {
+			drainIteratorIgnoreErrors(ctx, iter)
+			return nil, err
+		} else {
+			for _, col := range row {
+				str, err := toSqlString(ctx, col)
+				if err != nil {
+					drainIteratorIgnoreErrors(ctx, iter)
+					return nil, err
+				}
+				results = append(results, str)
+			}
+		}
+	}
+}
+
+func toSqlString(ctx *sql.Context, val interface{}) (string, error) {
+	if val == nil {
+		return "NULL", nil
+	}
+
+	switch v := val.(type) {
+	case sql.AnyWrapper:
+		unwrapped, err := sql.UnwrapAny(ctx, v)
+		if err != nil {
+			return "", err
+		}
+		return toSqlString(ctx, unwrapped)
+	case float32, float64:
+		// exactly 3 decimal points for floats
+		return fmt.Sprintf("%.3f", v), nil
+	case *apd.Decimal:
+		// exactly 3 decimal points for floats
+		res, _ := v.Float64()
+		return fmt.Sprintf("%.3f", res), nil
+	case int:
+		return strconv.Itoa(v), nil
+	case uint:
+		return strconv.Itoa(int(v)), nil
+	case int8:
+		return strconv.Itoa(int(v)), nil
+	case uint8:
+		return strconv.Itoa(int(v)), nil
+	case int16:
+		return strconv.Itoa(int(v)), nil
+	case uint16:
+		return strconv.Itoa(int(v)), nil
+	case int32:
+		return strconv.Itoa(int(v)), nil
+	case uint32:
+		return strconv.Itoa(int(v)), nil
+	case int64:
+		return strconv.Itoa(int(v)), nil
+	case uint64:
+		return strconv.Itoa(int(v)), nil
+	case string:
+		return v, nil
+	// Mysql returns 1 and 0 for boolean values, mimic that
+	case bool:
+		if v {
+			return "1", nil
+		} else {
+			return "0", nil
+		}
+	default:
+		panic(fmt.Sprintf("No conversion for value %v of type %T", val, val))
+	}
+}
+
+func schemaToSchemaString(sch sql.Schema) (string, error) {
+	b := strings.Builder{}
+	for _, col := range sch {
+		switch col.Type.Type() {
+		case query.Type_INT8, query.Type_INT16, query.Type_INT24, query.Type_INT32, query.Type_INT64,
+			query.Type_UINT8, query.Type_UINT16, query.Type_UINT24, query.Type_UINT32, query.Type_UINT64,
+			query.Type_BIT:
+			b.WriteString("I")
+		case query.Type_TEXT, query.Type_VARCHAR:
+			b.WriteString("T")
+		case query.Type_FLOAT32, query.Type_FLOAT64, query.Type_DECIMAL:
+			b.WriteString("R")
+		default:
+			return "", fmt.Errorf("Unhandled type: %v", col.Type)
+		}
+	}
+	return b.String(), nil
+}
+
+func sqlNewEngine(ctx context.Context, dEnv *env.DoltEnv, vars *sql.EngineVariables) (*sqle.Engine, dsess.DoltDatabaseProvider, error) {
+	db, err := dsql.NewDatabase(context.Background(), "dolt", dEnv.DbData(ctx), editor.Options{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.FS, dEnv)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	b := env.GetDefaultInitBranch(dEnv.Config)
+	pro, err := dsql.NewDoltDatabaseProviderWithDatabase(b, mrEnv.FileSystem(), db, dEnv.FS, sql.EngineOverrides{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	pro = pro.WithDbFactoryUrl(doltdb.InMemDoltDB)
+
+	engine := sqle.New(analyzer.NewDefault(pro), &sqle.Config{EngineVariables: vars})
+
+	return engine, pro, nil
+}

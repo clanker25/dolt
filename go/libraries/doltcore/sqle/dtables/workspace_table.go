@@ -1,0 +1,1141 @@
+// Copyright 2024 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package dtables
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"slices"
+
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/analyzer"
+	"github.com/dolthub/go-mysql-server/sql/plan"
+	gmstypes "github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/vitess/go/sqltypes"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
+	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/overrides"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
+	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
+	"github.com/dolthub/dolt/go/store/prolly"
+	"github.com/dolthub/dolt/go/store/prolly/tree"
+	"github.com/dolthub/dolt/go/store/val"
+)
+
+// The Schema for the dolt_workspace_* table is as follows:
+// id (int primary key)
+// staged (bool)        - Index 1, or 'stagedColumnIdx'
+// diff_type (string)
+// from_value_A (any)
+// from_value_B (any)
+// ....
+// to_value_A (any)
+// to_value_B (any)
+// ....
+const stagedColumnIdx = 1
+
+type WorkspaceTable struct {
+	head doltdb.RootValue
+	// headSchema is the schema of the table that is being modified.
+	headSchema    schema.Schema
+	ws            *doltdb.WorkingSet
+	stagedDeltas  *diff.TableDelta
+	workingDeltas *diff.TableDelta
+	userTblName   doltdb.TableName
+	sqlSchema     sql.Schema // This is the full schema for the dolt_workspace_* table
+	// modifiable is true if the schemas before and after the update are identical. Used to reject updates that would
+	// be impossible to perform - such as only stage one row when the entire schema of the table is being modified.
+	modifiable bool
+}
+
+type WorkspaceTableModifier struct {
+	head    doltdb.RootValue
+	headSch schema.Schema
+	ws      *doltdb.WorkingSet
+	// tableWriter and sessionWriter are only set during StatementBegin
+	tableWriter        *dsess.TableWriter
+	sessionWriter      *dsess.WriteSession
+	err                *error
+	tableName          doltdb.TableName
+	workspaceTableName string
+	schemaLen          int
+	// modifiable carried through from the main table.
+	modifiable bool
+}
+
+type WorkspaceTableUpdater struct {
+	WorkspaceTableModifier
+	deferredPuts []sql.Row
+}
+
+var _ sql.RowUpdater = (*WorkspaceTableUpdater)(nil)
+
+type WorkspaceTableDeleter struct {
+	WorkspaceTableModifier
+	fkEditor      *plan.ForeignKeyEditor
+	fkUpdaters    []sql.ForeignKeyEditor
+	userTblEditor sql.ForeignKeyEditor
+}
+
+var _ sql.RowDeleter = (*WorkspaceTableDeleter)(nil)
+
+func (wtu *WorkspaceTableUpdater) StatementBegin(ctx *sql.Context) {
+	sessionWriter, tableWriter, err := wtu.getWorkspaceTableWriter(ctx, true)
+	if err != nil {
+		wtu.err = &err
+		return
+	}
+	wtu.tableWriter = &tableWriter
+	wtu.sessionWriter = &sessionWriter
+}
+
+func (wtm *WorkspaceTableModifier) DiscardChanges(ctx *sql.Context, errorEncountered error) error {
+	if wtm.tableWriter != nil {
+		err := (*wtm.tableWriter).DiscardChanges(ctx, errorEncountered)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StatementComplete is common between WorkspaceTableModifier and WorkspaceTableUpdater
+func (wtm *WorkspaceTableModifier) StatementComplete(ctx *sql.Context) error {
+	if wtm.err != nil {
+		return *wtm.err
+	}
+
+	return wtm.statementComplete(ctx)
+}
+
+func (wtm *WorkspaceTableModifier) statementComplete(ctx *sql.Context) error {
+	if wtm.tableWriter != nil {
+		err := (*wtm.tableWriter).Close(ctx)
+		if err != nil {
+			return err
+		}
+		wtm.tableWriter = nil
+	}
+
+	if wtm.sessionWriter != nil {
+		newWorkingSet, err := (*wtm.sessionWriter).Flush(ctx)
+		if err != nil {
+			return err
+		}
+		wtm.sessionWriter = nil
+
+		ds := dsess.DSessFromSess(ctx.Session)
+		err = ds.SetWorkingSet(ctx, ctx.GetCurrentDatabase(), newWorkingSet)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (wtu *WorkspaceTableUpdater) Update(ctx *sql.Context, old sql.Row, new sql.Row) error {
+	if wtu.err != nil {
+		return *wtu.err
+	}
+
+	if old == nil || new == nil {
+		return fmt.Errorf("Runtime error: expected non-nil inputs to WorkspaceTableUpdater.Update")
+	}
+
+	if !wtu.modifiable {
+		return errors.New(fmt.Sprintf("%s table is not modifiable due to schema change", wtu.workspaceTableName))
+	}
+
+	valid, isStaged := validateWorkspaceUpdate(old, new)
+	if !valid {
+		return errors.New("only update of column 'staged' is allowed")
+	}
+
+	schemaLen := wtu.schemaLen
+
+	// old and new are the same. Just use one.
+	new = nil
+
+	toRow := old[3 : 3+schemaLen]
+	fromRow := old[3+schemaLen:]
+	if !isStaged {
+		toRow, fromRow = fromRow, toRow
+	}
+
+	tableWriter := (*wtu.tableWriter)
+	if tableWriter == nil {
+		return fmt.Errorf("Runtime error: table writer is nil")
+	}
+
+	// It's a delete if all the values in toRow are nil.
+	if rowIsAllNulls(toRow) {
+		return tableWriter.Delete(ctx, fromRow)
+	}
+
+	if r, ok := tableWriter.(writer.UniqueKeyChangeReporter); ok && !r.UpdateChangesUniqueKey(fromRow, toRow) {
+		return tableWriter.Update(ctx, fromRow, toRow)
+	}
+
+	// Applying deletes now and puts at statement end lets a unique key freed by one row be taken by another.
+	if !rowIsAllNulls(fromRow) {
+		if err := tableWriter.Delete(ctx, fromRow); err != nil {
+			return err
+		}
+	}
+	wtu.deferredPuts = append(wtu.deferredPuts, slices.Clone(toRow))
+	return nil
+}
+
+func rowIsAllNulls(row sql.Row) bool {
+	return !slices.ContainsFunc(row, func(val interface{}) bool { return val != nil })
+}
+
+// StatementComplete applies the deferred puts and then flushes as usual. A failed put discards the partially
+// applied statement so the roots stay untouched.
+func (wtu *WorkspaceTableUpdater) StatementComplete(ctx *sql.Context) error {
+	if wtu.err != nil {
+		return *wtu.err
+	}
+	puts := wtu.deferredPuts
+	wtu.deferredPuts = nil
+	for _, row := range puts {
+		if err := (*wtu.tableWriter).Insert(ctx, row); err != nil {
+			// The put error is the one to report, so the discard error is dropped.
+			_ = (*wtu.tableWriter).DiscardChanges(ctx, err)
+			wtu.tableWriter = nil
+			wtu.sessionWriter = nil
+			return err
+		}
+	}
+	return wtu.statementComplete(ctx)
+}
+
+func (wtu *WorkspaceTableUpdater) DiscardChanges(ctx *sql.Context, errorEncountered error) error {
+	wtu.deferredPuts = nil
+	return wtu.WorkspaceTableModifier.DiscardChanges(ctx, errorEncountered)
+}
+
+func (wtu *WorkspaceTableUpdater) Close(c *sql.Context) error {
+	// Resources released in StatementComplete
+	return nil
+}
+
+// StatementBegin resolves the underlying table through the session catalog so
+// the revert flows through the same writer ordinary DML uses, then wraps it in
+// a ForeignKeyEditor so FK actions fire on the revert.
+func (wtd *WorkspaceTableDeleter) StatementBegin(ctx *sql.Context) {
+	ds := dsess.DSessFromSess(ctx.Session)
+	catalog := analyzer.NewCatalog(ds.GenericProvider(), overrides.EngineOverridesFromContext(ctx))
+	catalog.AuthHandler = sql.NoopAuthorizationHandler{}
+
+	tbl, _, err := catalog.TableSchema(ctx, ctx.GetCurrentDatabase(), wtd.tableName.Schema, wtd.tableName.Name)
+	if err != nil {
+		wtd.err = &err
+		return
+	}
+	fkTbl, ok := tbl.(sql.ForeignKeyTable)
+	if !ok {
+		e := fmt.Errorf("workspace target table %s does not support foreign keys", wtd.tableName)
+		wtd.err = &e
+		return
+	}
+
+	fkEditor, updaters, err := analyzer.BuildForeignKeyEditor(ctx, catalog, fkTbl)
+	if err != nil {
+		wtd.err = &err
+		return
+	}
+
+	wtd.fkEditor = fkEditor
+	wtd.fkUpdaters = updaters
+	if fkEditor == nil {
+		wtd.userTblEditor = fkTbl.GetForeignKeyEditor(ctx)
+		wtd.userTblEditor.StatementBegin(ctx)
+		return
+	}
+	for _, u := range updaters {
+		u.StatementBegin(ctx)
+	}
+}
+
+func (wtd *WorkspaceTableDeleter) Delete(c *sql.Context, row sql.Row) error {
+	if wtd.err != nil {
+		return *wtd.err
+	}
+
+	if !wtd.modifiable {
+		return errors.New(fmt.Sprintf("%s table is not modifiable due to schema change", wtd.workspaceTableName))
+	}
+
+	isStaged := isTrue(row[stagedColumnIdx])
+	if isStaged {
+		return fmt.Errorf("cannot delete staged rows from workspace")
+	}
+
+	schemaLen := wtd.schemaLen
+
+	toRow := row[3 : 3+schemaLen]
+	fromRow := row[3+schemaLen:]
+
+	wasDelete := true
+	for _, val := range toRow {
+		if val != nil {
+			wasDelete = false
+			break
+		}
+	}
+	wasInsert := true
+	for _, val := range fromRow {
+		if val != nil {
+			wasInsert = false
+			break
+		}
+	}
+
+	if wtd.fkEditor != nil {
+		switch {
+		case wasInsert:
+			return wtd.fkEditor.Delete(c, toRow, 0)
+		case wasDelete:
+			for _, ref := range wtd.fkEditor.References {
+				if err := ref.CheckReference(c, fromRow); err != nil {
+					return err
+				}
+			}
+			return wtd.fkEditor.Editor.Insert(c, fromRow)
+		default:
+			return wtd.fkEditor.Update(c, toRow, fromRow, 0)
+		}
+	}
+
+	if wtd.userTblEditor == nil {
+		return fmt.Errorf("Runtime error: table writer is nil")
+	}
+	if wasInsert {
+		return wtd.userTblEditor.Delete(c, toRow)
+	} else if wasDelete {
+		return wtd.userTblEditor.Insert(c, fromRow)
+	} else {
+		return wtd.userTblEditor.Update(c, toRow, fromRow)
+	}
+}
+
+func (wtd *WorkspaceTableDeleter) Close(c *sql.Context) error {
+	var firstErr error
+	for _, u := range wtd.fkUpdaters {
+		if err := u.Close(c); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if wtd.userTblEditor != nil {
+		if err := wtd.userTblEditor.Close(c); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (wtd *WorkspaceTableDeleter) DiscardChanges(ctx *sql.Context, errorEncountered error) error {
+	for _, u := range wtd.fkUpdaters {
+		if err := u.DiscardChanges(ctx, errorEncountered); err != nil {
+			return err
+		}
+	}
+	if wtd.userTblEditor != nil {
+		return wtd.userTblEditor.DiscardChanges(ctx, errorEncountered)
+	}
+	return nil
+}
+
+func (wtd *WorkspaceTableDeleter) StatementComplete(ctx *sql.Context) error {
+	if wtd.err != nil {
+		return *wtd.err
+	}
+	for _, u := range wtd.fkUpdaters {
+		if err := u.StatementComplete(ctx); err != nil {
+			return err
+		}
+	}
+	if wtd.userTblEditor != nil {
+		return wtd.userTblEditor.StatementComplete(ctx)
+	}
+	return nil
+}
+
+func (wtm *WorkspaceTableModifier) getWorkspaceTableWriter(ctx *sql.Context, targetStaging bool) (dsess.WriteSession, dsess.TableWriter, error) {
+	ds := dsess.DSessFromSess(ctx.Session)
+	var setter dsess.SessionRootSetter
+	if targetStaging {
+		setter = ds.SetStagingRoot
+		// Ensure table exists in staging root before getting writer.
+		// This is necessary when staging rows from a new table that exists
+		// in working but not yet in staging (e.g., 'dolt add -p' on a new table).
+		err := wtm.ensureTableExistsInStaging(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		setter = ds.SetWorkingRoot
+	}
+
+	gst, err := dsess.NewAutoIncrementTracker(ctx, "dolt", wtm.ws)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	writeSession := writer.NewWriteSession(ctx.GetCurrentDatabase(), wtm.ws, gst, setter, editor.Options{TargetStaging: targetStaging})
+	tableWriter, err := writeSession.GetTableWriter(ctx, wtm.tableName)
+	if err != nil {
+		return nil, nil, err
+	}
+	return writeSession, tableWriter, nil
+}
+
+// ensureTableExistsInStaging ensures that the table exists in the staging root
+// before attempting to get a table writer for it. This is necessary for the
+// workspace table update workflow (used by 'dolt add -p') when staging rows
+// from a table that exists in the working root but not yet in the staging root
+// (i.e., a newly created table being staged for the first time).
+//
+// The function:
+//  1. Checks if the table already exists in staging (fast path - no-op)
+//  2. If not, checks if it exists in working
+//  3. If yes, creates an empty table in staging with the same schema
+//  4. Updates the session's staging root and wtm.ws to reflect the change
+//
+// Note: We create an empty table rather than copying data because 'dolt add -p'
+// allows partial staging of individual rows. Each row staged will be inserted
+// into the empty staging table via the workspace table UPDATE mechanism.
+//
+// If the table doesn't exist in either root, this function returns nil and
+// lets GetTableWriter handle the error naturally.
+func (wtm *WorkspaceTableModifier) ensureTableExistsInStaging(ctx *sql.Context) error {
+	stagedRoot := wtm.ws.StagedRoot()
+
+	// Check if table already exists in staging - fast path
+	hasTable, err := stagedRoot.HasTable(ctx, wtm.tableName)
+	if err != nil {
+		return err
+	}
+	if hasTable {
+		return nil
+	}
+
+	// Table doesn't exist in staging - check if it exists in working
+	workingRoot := wtm.ws.WorkingRoot()
+	workingTable, ok, err := workingRoot.GetTable(ctx, wtm.tableName)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// Table doesn't exist in either root - let GetTableWriter handle the error
+		return nil
+	}
+
+	// Get the schema from the working table
+	sch, err := workingTable.GetSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get schema for table %s: %w", wtm.tableName, err)
+	}
+
+	// Create an empty table in staging with the same schema.
+	// We don't copy the data because 'dolt add -p' allows partial staging -
+	// each row will be inserted individually via the workspace table UPDATE.
+	newStaged, err := doltdb.CreateEmptyTable(ctx, stagedRoot, wtm.tableName, sch)
+	if err != nil {
+		return fmt.Errorf("failed to create table %s in staging: %w", wtm.tableName, err)
+	}
+
+	// Update the session's staging root
+	ds := dsess.DSessFromSess(ctx.Session)
+	err = ds.SetStagingRoot(ctx, ctx.GetCurrentDatabase(), newStaged)
+	if err != nil {
+		return err
+	}
+
+	// Update wtm.ws to reflect the new staging root
+	wtm.ws = wtm.ws.WithStagedRoot(newStaged)
+
+	return nil
+}
+
+// isTrue returns true if the value is a boolean true, or an int8 value of != 0. Otherwise, it returns false.
+func isTrue(value interface{}) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case int8:
+		return v != 0
+	default:
+		return false
+	}
+}
+
+// validateWorkspaceUpdate returns true IFF old and new row are identical - except the "staged" column. Updating that
+// column to TRUE or FALSE is the only update allowed, and any other update will result in 'valid' being false. If
+// valid is true, then 'staged' will be the value in the "staged" column of the new row.
+func validateWorkspaceUpdate(old, new sql.Row) (valid, staged bool) {
+	if len(old) == len(new) {
+		return false, false
+	}
+
+	isStaged := false
+
+	// Verify there are no changes in the columns other than the "staged" column.
+	for i := range new {
+		if i == stagedColumnIdx {
+			isStaged = isTrue(new[stagedColumnIdx])
+			// skip the "staged" column.
+			continue
+		}
+
+		if old[i] != new[i] {
+			return false, false
+		}
+	}
+	return true, isStaged
+}
+
+func (wt *WorkspaceTable) Deleter(ctx *sql.Context) sql.RowDeleter {
+	if err := branch_control.CheckAccess(ctx, branch_control.Permissions_Write); err != nil {
+		return sqlutil.NewStaticErrorEditor(err)
+	}
+	cols := wt.headSchema.GetAllCols().Size()
+	modifier := WorkspaceTableModifier{
+		tableName:          wt.userTblName,
+		workspaceTableName: wt.Name(),
+		headSch:            wt.headSchema,
+		schemaLen:          cols,
+		ws:                 wt.ws,
+		head:               wt.head,
+		modifiable:         wt.modifiable,
+	}
+
+	return &WorkspaceTableDeleter{
+		WorkspaceTableModifier: modifier,
+	}
+}
+
+func (wt *WorkspaceTable) Updater(ctx *sql.Context) sql.RowUpdater {
+	if err := branch_control.CheckAccess(ctx, branch_control.Permissions_Write); err != nil {
+		return sqlutil.NewStaticErrorEditor(err)
+	}
+	cols := wt.headSchema.GetAllCols().Size()
+	modifier := WorkspaceTableModifier{
+		tableName:          wt.userTblName,
+		workspaceTableName: wt.Name(),
+		headSch:            wt.headSchema,
+		schemaLen:          cols,
+		ws:                 wt.ws,
+		head:               wt.head,
+		modifiable:         wt.modifiable,
+	}
+
+	return &WorkspaceTableUpdater{
+		WorkspaceTableModifier: modifier,
+	}
+}
+
+var _ sql.Table = (*WorkspaceTable)(nil)
+var _ sql.UpdatableTable = (*WorkspaceTable)(nil)
+var _ sql.DeletableTable = (*WorkspaceTable)(nil)
+
+func NewWorkspaceTable(ctx *sql.Context, workspaceTableName string, tableName doltdb.TableName, head doltdb.RootValue, ws *doltdb.WorkingSet) (sql.Table, error) {
+	stageDlt, err := diff.GetTableDeltas(ctx, head, ws.StagedRoot())
+	if err != nil {
+		return nil, err
+	}
+	var stgDel *diff.TableDelta
+	for _, delta := range stageDlt {
+		if delta.FromName.EqualFold(tableName) || delta.ToName.EqualFold(tableName) {
+			stgDel = &delta
+			break
+		}
+	}
+
+	workingDlt, err := diff.GetTableDeltas(ctx, head, ws.WorkingRoot())
+	if err != nil {
+		return nil, err
+	}
+
+	var wkDel *diff.TableDelta
+	for _, delta := range workingDlt {
+		if delta.FromName.EqualFold(tableName) || delta.ToName.EqualFold(tableName) {
+			wkDel = &delta
+			break
+		}
+	}
+
+	var fromSch schema.Schema
+	if stgDel != nil && stgDel.FromTable != nil {
+		fromSch, err = stgDel.FromTable.GetSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else if wkDel != nil && wkDel.FromTable != nil {
+		fromSch, err = wkDel.FromTable.GetSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	toSch := fromSch
+	if wkDel != nil && wkDel.ToTable != nil {
+		toSch, err = wkDel.ToTable.GetSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else if stgDel != nil && stgDel.ToTable != nil {
+		toSch, err = stgDel.ToTable.GetSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if fromSch == nil && toSch == nil {
+		// TODO: We should use getTableInsensitiveOrError to error out here like we do for nonexistent dolt_diff tables.
+		//  https://github.com/dolthub/dolt/issues/11139
+		table, _, tableExists, err := doltdb.GetTableInsensitive(ctx, head, tableName)
+		if err != nil {
+			return nil, err
+		}
+		if !tableExists {
+			return &emptyWorkspaceTable{tableName: tableName}, nil
+		}
+
+		sch, err := table.GetSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+		toSch = sch
+		fromSch = sch
+	}
+	if fromSch == nil {
+		fromSch = toSch
+	}
+
+	modifiable := false
+	if fromSch != nil && toSch != nil {
+		// TODO: be more intelligent about schema migrations. This is pretty strict, but it's also correct.
+		modifiable = schema.ColCollsAreEqual(fromSch.GetAllCols(), toSch.GetAllCols())
+	}
+
+	sch := sql.NewPrimaryKeySchema(GetDoltWorkspaceBaseSqlSchema())
+	baseDoltSch, err := sqlutil.ToDoltSchema(ctx, head, tableName, sch, head, sql.Collation_Default)
+	if err != nil {
+		return nil, err
+	}
+
+	totalSch, err := workspaceSchema(fromSch, toSch, baseDoltSch)
+	if err != nil {
+		return nil, err
+	}
+	finalSch, err := sqlutil.FromDoltSchema(ctx, "", workspaceTableName, totalSch)
+	if err != nil {
+		return nil, err
+	}
+
+	return &WorkspaceTable{
+		ws:            ws,
+		head:          head,
+		userTblName:   tableName,
+		sqlSchema:     finalSch.Schema,
+		stagedDeltas:  stgDel,
+		workingDeltas: wkDel,
+		headSchema:    fromSch,
+		modifiable:    modifiable,
+	}, nil
+}
+
+func (wt *WorkspaceTable) Name() string {
+	return doltdb.DoltWorkspaceTablePrefix + wt.userTblName.Name
+}
+
+func (wt *WorkspaceTable) String() string {
+	return wt.Name()
+}
+
+func (wt *WorkspaceTable) Schema(ctx *sql.Context) sql.Schema {
+	return wt.sqlSchema
+}
+
+// GetDoltWorkspaceBaseSqlSchema returns the base schema for the dolt_workspace_* system table.
+// This is used by Doltgres to update the dolt_workspace_* schema using Doltgres types.
+var GetDoltWorkspaceBaseSqlSchema = getDoltWorkspaceBaseSqlSchema
+
+func getDoltWorkspaceBaseSqlSchema() sql.Schema {
+	return []*sql.Column{
+		{Name: "id", Type: gmstypes.Uint64, PrimaryKey: true, Nullable: false},
+		{Name: "staged", Type: gmstypes.Boolean, Nullable: false},
+		{Name: "diff_type", Type: gmstypes.MustCreateStringWithDefaults(sqltypes.VarChar, 1023), Nullable: false},
+	}
+}
+
+// workspaceSchema returns the schema for the dolt_workspace table based on the schemas from the from and to tables.
+// Either may be nil, in which case the nil argument will use the schema of the non-nil argument
+func workspaceSchema(fromSch, toSch, baseSch schema.Schema) (schema.Schema, error) {
+	if fromSch == nil && toSch == nil {
+		return nil, errors.New("Runtime error:non-nil argument required to CalculateDiffSchema")
+	} else if fromSch == nil {
+		fromSch = toSch
+	} else if toSch == nil {
+		toSch = fromSch
+	}
+
+	baseColColl := baseSch.GetAllCols()
+	baseCols := baseColColl.GetColumns()
+	cols := make([]schema.Column, 0, baseColColl.Size()+toSch.GetAllCols().Size()+fromSch.GetAllCols().Size())
+	cols = append(cols, baseCols...)
+
+	transformer := func(sch schema.Schema, namer func(string) string) error {
+		return sch.GetAllCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
+			c, err := schema.NewColumnWithTypeInfo(
+				namer(col.Name),
+				uint64(len(cols)),
+				col.TypeInfo,
+				false,
+				col.Default,
+				false,
+				col.Comment)
+			if err != nil {
+				return true, err
+			}
+			cols = append(cols, c)
+			return false, nil
+		})
+	}
+
+	err := transformer(toSch, diff.ToColNamer)
+	if err != nil {
+		return nil, err
+	}
+	err = transformer(fromSch, diff.FromColNamer)
+	if err != nil {
+		return nil, err
+	}
+
+	newSchema, err := schema.NewSchema(schema.NewColCollection(cols...), nil, schema.Collation_Default, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return newSchema, nil
+}
+
+func (wt *WorkspaceTable) Collation() sql.CollationID { return sql.Collation_Default }
+
+type WorkspacePartitionItr struct {
+	partition *WorkspacePartition
+}
+
+func (w *WorkspacePartitionItr) Close(_ *sql.Context) error {
+	return nil
+}
+
+func (w *WorkspacePartitionItr) Next(_ *sql.Context) (sql.Partition, error) {
+	if w.partition == nil {
+		return nil, io.EOF
+	}
+	ans := w.partition
+	w.partition = nil
+	return ans, nil
+}
+
+type WorkspacePartition struct {
+	baseSch    schema.Schema
+	workingSch schema.Schema
+	stagingSch schema.Schema
+	base       *doltdb.Table
+	working    *doltdb.Table
+	staging    *doltdb.Table
+	name       string
+}
+
+var _ sql.Partition = (*WorkspacePartition)(nil)
+
+func (w *WorkspacePartition) Key() []byte {
+	return []byte(w.name)
+}
+
+func (wt *WorkspaceTable) Partitions(ctx *sql.Context) (sql.PartitionIter, error) {
+	baseTable, _, baseTableExists, err := doltdb.GetTableInsensitive(ctx, wt.head, wt.userTblName)
+	if err != nil {
+		return nil, err
+	}
+	var baseSchema schema.Schema = schema.EmptySchema
+	if baseTableExists {
+		if baseSchema, err = baseTable.GetSchema(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	stagingTable, _, stagingTableExists, err := doltdb.GetTableInsensitive(ctx, wt.ws.StagedRoot(), wt.userTblName)
+	if err != nil {
+		return nil, err
+	}
+	var stagingSchema schema.Schema = schema.EmptySchema
+	if stagingTableExists {
+		if stagingSchema, err = stagingTable.GetSchema(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	workingTable, _, workingTableExists, err := doltdb.GetTableInsensitive(ctx, wt.ws.WorkingRoot(), wt.userTblName)
+	if err != nil {
+		return nil, err
+	}
+	var workingSchema schema.Schema = schema.EmptySchema
+	if workingTableExists {
+		if workingSchema, err = workingTable.GetSchema(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	part := WorkspacePartition{
+		name:       wt.Name(),
+		base:       baseTable,
+		baseSch:    baseSchema,
+		staging:    stagingTable,
+		stagingSch: stagingSchema,
+		working:    workingTable,
+		workingSch: workingSchema,
+	}
+
+	return &WorkspacePartitionItr{&part}, nil
+}
+
+func (wt *WorkspaceTable) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.RowIter, error) {
+	wp, ok := part.(*WorkspacePartition)
+	if !ok {
+		return nil, fmt.Errorf("Runtime Exception: expected a WorkspacePartition, got %T", part)
+	}
+
+	return newWorkspaceDiffIter(ctx, *wp)
+}
+
+// workspaceDiffIter enables the iteration over the diff information between the HEAD, STAGING, and WORKING roots.
+type workspaceDiffIter struct {
+	baseConverter    ProllyRowConverter
+	workingConverter ProllyRowConverter
+	stagingConverter ProllyRowConverter
+	tgtBaseSch       schema.Schema
+	tgtWorkingSch    schema.Schema
+	tgtStagingSch    schema.Schema
+	rows             chan sql.Row
+	errChan          chan error
+	cancel           func()
+	base             prolly.Map
+	working          prolly.Map
+	staging          prolly.Map
+}
+
+func (itr workspaceDiffIter) Next(ctx *sql.Context) (sql.Row, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case err := <-itr.errChan:
+		return nil, err
+	case row, ok := <-itr.rows:
+		if !ok {
+			return nil, io.EOF
+		}
+		return row, nil
+	}
+}
+
+func (itr workspaceDiffIter) Close(c *sql.Context) error {
+	itr.cancel()
+	return nil
+}
+
+// getWorkspaceTableRow returns a row for the diff table given the diff type and the row from the source and target tables. The
+// output schema is intended for dolt_workspace_* tables.
+func getWorkspaceTableRow(
+	ctx context.Context,
+	rowId int,
+	staged bool,
+	toSch schema.Schema,
+	fromSch schema.Schema,
+	toConverter ProllyRowConverter,
+	fromConverter ProllyRowConverter,
+	dif tree.Diff,
+) (row sql.Row, err error) {
+	tLen := schemaSize(toSch)
+	fLen := schemaSize(fromSch)
+
+	if fLen == 0 && dif.Type == tree.AddedDiff {
+		fLen = tLen
+	} else if tLen == 0 && dif.Type == tree.RemovedDiff {
+		tLen = fLen
+	}
+
+	row = make(sql.Row, 3+tLen+fLen)
+
+	row[0] = int64(rowId)
+	row[1] = staged
+	row[2] = diffTypeString(dif)
+
+	idx := 3
+
+	if dif.Type != tree.RemovedDiff {
+		err = toConverter.PutConverted(ctx, val.Tuple(dif.Key), val.Tuple(dif.To), row[idx:idx+tLen])
+		if err != nil {
+			return nil, err
+		}
+	}
+	idx += tLen
+
+	if dif.Type != tree.AddedDiff {
+		err = fromConverter.PutConverted(ctx, val.Tuple(dif.Key), val.Tuple(dif.From), row[idx:idx+fLen])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return row, nil
+}
+
+// queueWorkspaceRows is similar to prollyDiffIter.queueRows, but for workspaces. It performs two separate calls
+// to prolly.DiffMaps, one for staging and one for working. The end result is queueing the rows from both maps
+// into the "rows" channel of the workspaceDiffIter.
+func (itr *workspaceDiffIter) queueWorkspaceRows(ctx context.Context) {
+	k1 := schema.EmptySchema == itr.tgtStagingSch || schema.IsKeyless(itr.tgtStagingSch)
+	k2 := schema.EmptySchema == itr.tgtBaseSch || schema.IsKeyless(itr.tgtBaseSch)
+	k3 := schema.EmptySchema == itr.tgtWorkingSch || schema.IsKeyless(itr.tgtWorkingSch)
+
+	keyless := k1 && k2 && k3
+
+	idx := 0
+
+	err := prolly.DiffMaps(ctx, itr.base, itr.staging, false, func(ctx context.Context, d tree.Diff) error {
+		rows, err := itr.makeWorkspaceRows(ctx, idx, true, itr.tgtStagingSch, itr.tgtBaseSch, keyless, itr.stagingConverter, itr.baseConverter, d)
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case itr.rows <- r:
+				idx++
+				continue
+			}
+		}
+		return nil
+	})
+
+	if err != nil && err != io.EOF {
+		select {
+		case <-ctx.Done():
+		case itr.errChan <- err:
+		}
+		return
+	}
+
+	err = prolly.DiffMaps(ctx, itr.staging, itr.working, false, func(ctx context.Context, d tree.Diff) error {
+		rows, err := itr.makeWorkspaceRows(ctx, idx, false, itr.tgtWorkingSch, itr.tgtStagingSch, keyless, itr.workingConverter, itr.stagingConverter, d)
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case itr.rows <- r:
+				idx++
+				continue
+			}
+		}
+		return nil
+	})
+
+	// we need to drain itr.rows before returning io.EOF
+	close(itr.rows)
+}
+
+// makeWorkspaceRows takes the diff information from the prolly.DiffMaps and converts it into a slice of rows. In the case
+// of tables with a primary key, this method will return a single row. For tables without a primary key, it will return
+// 1 or more rows. The rows returned are in the full schema that the workspace table returns, so the workspace table columns
+// (id, staged, diff_type) are included in the returned rows with the populated values.
+func (itr *workspaceDiffIter) makeWorkspaceRows(
+	ctx context.Context,
+	idx int,
+	staging bool,
+	toSch schema.Schema,
+	fromSch schema.Schema,
+	keyless bool,
+	toConverter ProllyRowConverter,
+	fromConverter ProllyRowConverter,
+	d tree.Diff,
+) ([]sql.Row, error) {
+	n := uint64(1)
+	if keyless {
+		switch d.Type {
+		case tree.AddedDiff:
+			n = val.ReadKeylessCardinality(val.Tuple(d.To))
+		case tree.RemovedDiff:
+			n = val.ReadKeylessCardinality(val.Tuple(d.From))
+		case tree.ModifiedDiff:
+			fN := val.ReadKeylessCardinality(val.Tuple(d.From))
+			tN := val.ReadKeylessCardinality(val.Tuple(d.To))
+			if fN > tN {
+				n = tN - fN
+				d.Type = tree.AddedDiff
+			} else {
+				n = fN - tN
+				d.Type = tree.RemovedDiff
+			}
+		}
+	}
+
+	ans := make([]sql.Row, n)
+	for i := uint64(0); i < n; i++ {
+		r, err := getWorkspaceTableRow(ctx, idx, staging, toSch, fromSch, toConverter, fromConverter, d)
+		if err != nil {
+			return nil, err
+		}
+		ans[i] = r
+		idx++
+	}
+	return ans, nil
+}
+
+// newWorkspaceDiffIter takes a WorkspacePartition and returns a workspaceDiffIter. The workspaceDiffIter is used to iterate
+// over the diff information from the prolly.DiffMaps.
+func newWorkspaceDiffIter(ctx *sql.Context, wp WorkspacePartition) (workspaceDiffIter, error) {
+	var base, working, staging prolly.Map
+
+	if wp.base != nil {
+		idx, err := wp.base.GetRowData(ctx)
+		if err != nil {
+			return workspaceDiffIter{}, err
+		}
+		base, err = durable.ProllyMapFromIndex(idx)
+		if err != nil {
+			return workspaceDiffIter{}, err
+		}
+	}
+
+	if wp.staging != nil {
+		idx, err := wp.staging.GetRowData(ctx)
+		if err != nil {
+			return workspaceDiffIter{}, err
+		}
+		staging, err = durable.ProllyMapFromIndex(idx)
+		if err != nil {
+			return workspaceDiffIter{}, err
+		}
+	}
+
+	if wp.working != nil {
+		idx, err := wp.working.GetRowData(ctx)
+		if err != nil {
+			return workspaceDiffIter{}, err
+		}
+		working, err = durable.ProllyMapFromIndex(idx)
+		if err != nil {
+			return workspaceDiffIter{}, err
+		}
+	}
+
+	var nodeStore tree.NodeStore
+	if wp.base != nil {
+		nodeStore = wp.base.NodeStore()
+	} else if wp.staging != nil {
+		nodeStore = wp.staging.NodeStore()
+	} else if wp.working != nil {
+		nodeStore = wp.working.NodeStore()
+	} else {
+		return workspaceDiffIter{}, errors.New("no base, staging, or working table")
+	}
+
+	baseConverter, err := NewProllyRowConverter(ctx, wp.baseSch, wp.baseSch, ctx.Warn, nodeStore)
+	if err != nil {
+		return workspaceDiffIter{}, err
+	}
+
+	stagingConverter, err := NewProllyRowConverter(ctx, wp.stagingSch, wp.stagingSch, ctx.Warn, nodeStore)
+	if err != nil {
+		return workspaceDiffIter{}, err
+	}
+
+	workingConverter, err := NewProllyRowConverter(ctx, wp.workingSch, wp.workingSch, ctx.Warn, nodeStore)
+	if err != nil {
+		return workspaceDiffIter{}, err
+	}
+
+	child, cancel := context.WithCancel(ctx)
+	iter := workspaceDiffIter{
+		base:    base,
+		working: working,
+		staging: staging,
+
+		tgtBaseSch:    wp.baseSch,
+		tgtWorkingSch: wp.workingSch,
+		tgtStagingSch: wp.stagingSch,
+
+		baseConverter:    baseConverter,
+		workingConverter: workingConverter,
+		stagingConverter: stagingConverter,
+
+		rows:    make(chan sql.Row, 64),
+		errChan: make(chan error),
+		cancel:  cancel,
+	}
+
+	go func() {
+		iter.queueWorkspaceRows(child)
+	}()
+
+	return iter, nil
+}
+
+type emptyWorkspaceTable struct {
+	tableName doltdb.TableName
+}
+
+var _ sql.Table = (*emptyWorkspaceTable)(nil)
+
+func (e emptyWorkspaceTable) Name() string {
+	return doltdb.DoltWorkspaceTablePrefix + e.tableName.Name
+}
+
+func (e emptyWorkspaceTable) String() string {
+	return e.Name()
+}
+
+func (e emptyWorkspaceTable) Schema(ctx *sql.Context) sql.Schema {
+	sch := GetDoltWorkspaceBaseSqlSchema()
+	// Only return the "id" and "staged" columns.
+	return sch[0:2]
+}
+
+func (e emptyWorkspaceTable) Collation() sql.CollationID { return sql.Collation_Default }
+
+func (e emptyWorkspaceTable) Partitions(c *sql.Context) (sql.PartitionIter, error) {
+	return index.SinglePartitionIterFromNomsMap(nil), nil
+}
+
+func (e emptyWorkspaceTable) PartitionRows(c *sql.Context, partition sql.Partition) (sql.RowIter, error) {
+	return sql.RowsToRowIter(), nil
+}

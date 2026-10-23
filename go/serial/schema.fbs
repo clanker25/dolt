@@ -1,0 +1,174 @@
+// Copyright 2021 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+include "encoding.fbs";
+include "collation.fbs";
+
+namespace serial;
+
+enum DistanceType : uint8 {
+  Null          = 0,
+  L2_Squared    = 1,
+  Cosine        = 2,
+  InnerProduct  = 3,
+  L1            = 4,
+}
+
+table TableSchema {
+  columns:[Column] (required);
+  clustered_index:Index (required);
+  secondary_indexes:[Index];
+  checks:[CheckConstraint];
+  collation:Collation;
+
+  // this field is necessary because older dolt clients weren't using TryAccessor for Columns, but are in TableSchemas
+  has_features_after_try_accessors:bool;
+
+  // table comment
+  comment:string;
+
+  // target row size (used with adaptive encoded columns)
+  target_row_size:uint16 = 2048;
+}
+
+table Column {
+  // column name
+  name:string (required);
+
+  // sql column type
+  sql_type:string;
+
+  // sql default value. For generated columns, this is the generated expression rather than the default.
+  default_value:string;
+
+  // sql comment
+  comment:string;
+
+  // sql display order
+  display_order:int16;
+
+  // column tag
+  tag: uint64;
+
+  // storage encoding
+  encoding:Encoding;
+
+  // column meta
+  primary_key:bool;
+  nullable:bool;
+  auto_increment:bool;
+  hidden:bool;
+  generated:bool;
+  virtual:bool;
+
+  // sql on update value
+  on_update_value:string;
+
+  // a marker value only written when the column uses adaptive encoding, which will force older clients to upgrade
+  // before reading this data.
+  uses_adaptive_encoding:bool;
+
+  // hidden system columns are not directly accessible or visible by users, and are used to
+  // store functional expression results for use in secondary indexes
+  hidden_system:bool;
+  
+  // A range of 1.x releases from approximately 1.86.0 onwards had a nasty bug with adaptive encoded values where
+  // data loss could occur during garbage collection or pull operations. This field forces clients from that release 
+  // range to upgrade before reading schemas with adaptive encoded columns.
+  adaptive_encoding_breaking_change:bool;
+}
+
+table Index {
+  // index name
+  name:string;
+
+  // sql comment
+  comment:string;
+
+  // ordered list of columns defining the index.
+  // stored as indices into columns vector.
+  index_columns:[uint16] (required);
+
+  // ordered list of columns corresponding to
+  // key tuple fields within index storage.
+  // stored as indices into columns vector.
+  //
+  // for secondary indexes, this is typically
+  // index columns + primary key columns.
+  key_columns:[uint16] (required);
+
+  // ordered list of columns corresponding to
+  // value tuple fields within index storage.
+  // stored as indices into columns vector.
+  //
+  // typically, this is only populated for
+  // clustered primary key indexes.
+  value_columns:[uint16];
+
+  // index meta
+  primary_key:bool;
+  unique_key:bool;
+  system_defined:bool;
+
+  prefix_lengths:[uint16];
+  spatial_key:bool;
+
+  // fulltext information
+  fulltext_key:bool;
+  fulltext_info:FulltextInfo;
+
+  // vector information
+  // these fields should be set for vector indexes and otherwise omitted, for backwards compatibility
+  vector_key:bool;
+  vector_info:VectorInfo;
+
+  // WHERE clause expression string for partial indexes (empty for full indexes)
+  predicate:string;
+
+  // per-column sort order, parallel to index_columns.
+  // omitted when every column is ascending with NULLs first.
+  descending:[bool];
+  nulls_last:[bool];
+
+  // per-column operator class, parallel to index_columns.
+  // omitted when no column has one.
+  op_classes:[string];
+}
+
+table FulltextInfo {
+  config_table:string;
+  position_table:string;
+  doc_count_table:string;
+  global_count_table:string;
+  row_count_table:string;
+  key_type:uint8;
+  key_name:string;
+  key_positions:[uint16];
+}
+
+table VectorInfo {
+    distance_type:DistanceType;
+}
+
+table CheckConstraint {
+    name:string;
+    expression:string;
+    enforced:bool;
+    is_not_valid:bool;
+}
+
+// KEEP THIS IN SYNC WITH fileidentifiers.go
+file_identifier "DSCH";
+
+root_type TableSchema;

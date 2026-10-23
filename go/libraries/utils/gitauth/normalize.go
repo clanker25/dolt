@@ -1,0 +1,77 @@
+// Copyright 2026 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package gitauth
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os/exec"
+	"strings"
+)
+
+// NonInteractiveAuthError wraps a git remote error and appends credential
+// hint lines so the user knows how to configure auth before retrying.
+type NonInteractiveAuthError struct {
+	Output string
+	Cause  error
+}
+
+func (e *NonInteractiveAuthError) Error() string {
+	var b strings.Builder
+	if e.Output != "" {
+		b.WriteString(strings.TrimRight(e.Output, "\n"))
+		b.WriteString("\n")
+	} else if e.Cause != nil {
+		b.WriteString(e.Cause.Error())
+		b.WriteString("\n")
+	}
+	b.WriteString("hint: dolt does not support interactive credential prompts\n")
+	b.WriteString("hint: configure git credentials (credential helper, token) for HTTPS remotes\n")
+	b.WriteString("hint: run `ssh-add <key>` to pre-load your key for SSH remotes\n")
+	b.WriteString("hint: ensure non-interactive auth is configured for GCM")
+	return b.String()
+}
+
+func (e *NonInteractiveAuthError) Unwrap() error { return e.Cause }
+
+// NormalizeError wraps |err| in a [NonInteractiveAuthError] so that
+// credential hints are always appended to git remote failures.
+//
+// Neither a command |ctx| cancelled nor one whose Wait gave up on pipes an
+// outliving process still holds is an auth failure, so those keep their own error
+// and get no hints. A cancelled command surfaces as the child's kill signal, so
+// |ctx|'s error is joined in for callers that test for it.
+func NormalizeError(ctx context.Context, err error, output []byte) error {
+	if err == nil {
+		return nil
+	}
+	var already *NonInteractiveAuthError
+	if errors.As(err, &already) {
+		return err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(ctxErr, err)
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return err
+	}
+	return &NonInteractiveAuthError{
+		Output: string(bytes.TrimSpace(output)),
+		Cause:  err,
+	}
+}
+
+var _ error = (*NonInteractiveAuthError)(nil)

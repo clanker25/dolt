@@ -1,0 +1,227 @@
+#! /usr/bin/env bats
+load $BATS_TEST_DIRNAME/helper/common.bash
+
+setup() {
+    setup_no_dolt_init
+}
+
+teardown() {
+    teardown_common
+}
+
+# Inserts 25 new rows and commits them.
+insert_statement() {
+  res="INSERT INTO tbl (guid) VALUES (UUID());"
+  for ((i=1; i<=24; i++))
+  do
+    res="$res INSERT INTO tbl (guid) VALUES (UUID());"
+  done
+  res="$res call dolt_commit(\"-A\", \"--allow-empty\", \"-m\", \"Add 25 values\");"
+  echo "$res"
+}
+
+# Updates 10 random rows and commits the changes.
+update_statement() {
+  res="SET @max_id = (SELECT MAX(i) FROM tbl);
+SET @random_id = FLOOR(1 + RAND() * @max_id);
+UPDATE tbl SET guid = UUID() WHERE i >= @random_id LIMIT 1;"
+  for ((i=1; i<=9; i++))
+  do
+    res="$res
+SET @max_id = (SELECT MAX(i) FROM tbl);
+SET @random_id = FLOOR(1 + RAND() * @max_id);
+UPDATE tbl SET guid = UUID() WHERE i >= @random_id LIMIT 1;"
+  done
+  res="$res call dolt_commit(\"-A\", \"--allow-empty\", \"-m\", \"Update 10 values\");"
+  echo "$res"
+}
+
+@test "fsck: bad commit" {
+  mkdir .dolt
+  cp -R $BATS_CWD/corrupt_dbs/bad_commit/* .dolt/
+
+  # validate that cp worked.
+  dolt status
+
+  run dolt fsck
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "Chunk: rlmgv0komq0oj7qu4osdo759vs4c5pvg content hash mismatch: gpphmuvegiedtjtbfku4ru8jalfdk21u" ]] || false
+  [[ "$output" =~ "hacky@hackypants.com" ]] || false
+}
+
+@test "fsck: good archive" {
+  dolt init
+  dolt sql -q "create table tbl (i int auto_increment primary key, guid char(36))"
+  dolt commit -A -m "create tbl"
+
+  stmt=""
+  for ((j=1; j<=10; j++))
+  do
+      stmt="$stmt $(insert_statement)"
+      stmt="$stmt $(update_statement)"
+  done
+  dolt sql -q "$stmt"
+
+  dolt gc --archive-level 1
+
+  dolt fsck
+}
+
+@test "fsck: good journal" {
+  dolt init
+  dolt sql -q "create table tbl (i int auto_increment primary key, guid char(36))"
+  dolt commit -Am "Create table tbl"
+
+  dolt sql -q "$(insert_statement)"
+
+  # Objects are in the journal. Don't gc.
+  dolt fsck
+}
+
+@test "fsck: bad journal crc" {
+  mkdir .dolt
+  cp -R $BATS_CWD/corrupt_dbs/bad_journal_crc/* .dolt/
+
+  run dolt fsck
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "Chunk: 7i48kt4h41hcjniri7scv5m8a69cdn13 content hash mismatch: hitg0bb0hsakip96qvu2hts0hkrrla9o" ]] || false
+}
+
+@test "fsck: bad journal crc, suggests data loss recovery" {
+  mkdir .dolt
+  cp -R $BATS_CWD/corrupt_dbs/bad_journal_crc_2/* .dolt/
+
+  run dolt fsck
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "WARNING: Chunk journal is corrupted and some data may be lost." ]] || false
+  [[ "$output" =~ "Run \`dolt fsck --revive-journal-with-data-loss\`" ]] || false
+}
+
+@test "fsck: recover from broken journal" {
+  dolt init
+  dolt sql -q "create table recovermeplease (i int auto_increment primary key, guid char(36))"
+  dolt commit -Am "Create table recovermeplease"
+
+  local journal=".dolt/noms/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+  # append some bytes which are going to stop the journal reading process, then append a couple records.
+  printf '\x00\x00\x00\x00' >> "$journal"
+  cat $BATS_CWD/corrupt_dbs/journal_data.bin >> "$journal"
+
+  run dolt log
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "please run 'dolt fsck' to assess the damage and attempt repairs" ]] || false
+
+  run dolt fsck
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "dolt fsck --revive-journal-with-data-loss" ]] || false
+
+  run dolt fsck --revive-journal-with-data-loss
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "please file a ticket: https://github.com/dolthub/dolt/issues" ]] || false
+
+  dolt fsck
+
+  run dolt show
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "recovermeplease" ]] || false
+
+  # Look for the save file.
+  ls .dolt/noms/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv_save_* >/dev/null 2>&1
+}
+
+@test "fsck: do nothing when nothing is wrong with journal" {
+  dolt init
+  dolt sql -q "create table recovermenoloss (i int auto_increment primary key, guid char(36))"
+  dolt commit -Am "Create table recovermenoloss"
+
+  run dolt fsck --revive-journal-with-data-loss
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "no data loss detected in chunk journal file; no recovery performed" ]] || false
+
+  run dolt show
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "recovermenoloss" ]] || false
+}
+
+@test "fsck: missing closure object" {
+  mkdir .dolt
+  cp -R $BATS_CWD/corrupt_dbs/missing_closure_object/* .dolt/
+
+  run dolt fsck
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "::commit:00apprui1m4mtcs8umenpt8e2lkjmihc: missing data. failed to read commit closure d92u2dpnhocp5pv4pn7vgm9fs30vdv94" ]] || false
+}
+
+@test "fsck: missing schema object" {
+  mkdir .dolt
+  cp -R $BATS_CWD/corrupt_dbs/missing_schema_object/* .dolt/
+
+  run dolt fsck
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "::commit:gub2hagj8cp2mcdlp95l90sisp37iupd: read failure of 8tsjiu5fcsvchoo4re8bgftuuogl7ko1" ]] || false
+}
+
+@test "fsck: missing fk object" {
+  mkdir .dolt
+  cp -R $BATS_CWD/corrupt_dbs/missing_fk_object/* .dolt/
+
+  run dolt fsck
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "::commit:sf9a4d6i5pg2uds56s18qpsfmv7v8r11: read failure of g0a5tikh3d9rnb9olelkffpukalc4v7o" ]] || false
+}
+
+@test "fsck: missing table object" {
+  mkdir .dolt
+  cp -R $BATS_CWD/corrupt_dbs/missing_table_object/* .dolt/
+
+  run dolt fsck
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "::commit:0vh56jekvb9hs0kqf8e8dc5208s0o0mi: read failure of fthj68monkbgkrb6g4c11php7ht2dib" ]] || false
+}
+
+@test "fsck: opens database correctly on Windows paths including spaces" {
+  # Normal path
+  dolt init
+  dolt sql -q "create table t (i int primary key)"
+  dolt commit -Am "create t"
+
+  run dolt fsck
+  [ "$status" -eq 0 ]
+  ! [[ "$output" =~ "the filename, directory name, or volume label syntax is incorrect" ]] || false
+
+  # Path with spaces
+  local spacedir
+  spacedir="$(mktemp -d "$BATS_TMPDIR/fsck spaces XXXXXX")"
+  cd "$spacedir"
+
+  dolt init
+  dolt sql -q "create table t (i int primary key)"
+  dolt commit -Am "create t"
+
+  run dolt fsck
+  [ "$status" -eq 0 ]
+  ! [[ "$output" =~ "the filename, directory name, or volume label syntax is incorrect" ]] || false
+}
+
+@test "fsck: passes with a stash present" {
+  dolt init
+  dolt sql -q "create table t (id int primary key, value int); insert into t values (1, 1);"
+  dolt add t
+  dolt commit -m "initialize repro table"
+
+  dolt sql -q "update t set value=2 where id=1;"
+  dolt stash
+
+  run dolt stash list
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "stash@{0}" ]] || false
+
+  run dolt fsck
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "No problems found." ]] || false
+  ! [[ "$output" =~ "has incorrect file ID" ]] || false
+
+  run dolt stash list
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "stash@{0}" ]] || false
+}

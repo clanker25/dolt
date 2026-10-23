@@ -1,0 +1,465 @@
+// Copyright 2020 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package dtables
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"slices"
+	"sync"
+
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/types"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/fk"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
+	"github.com/dolthub/dolt/go/store/hash"
+)
+
+const branchesDefaultRowCount = 10
+
+// doltBranchesIndexName is the name of the index on the dolt_branches system table that covers
+// the "name" field.
+const doltBranchesIndexName = "dolt_branches_name_idx"
+
+var _ sql.Table = (*BranchesTable)(nil)
+var _ sql.StatisticsTable = (*BranchesTable)(nil)
+var _ sql.UpdatableTable = (*BranchesTable)(nil)
+var _ sql.DeletableTable = (*BranchesTable)(nil)
+var _ sql.InsertableTable = (*BranchesTable)(nil)
+var _ sql.ReplaceableTable = (*BranchesTable)(nil)
+var _ sql.ForeignKeyTable = (*BranchesTable)(nil)
+var _ sql.IndexAddressableTable = (*BranchesTable)(nil)
+
+// BranchesTable is the system table that accesses branches
+type BranchesTable struct {
+	db        dsess.SqlDatabase
+	tableName string
+	remote    bool
+}
+
+// IndexedAccess creates a snapshot shared by every lookup in this execution.
+func (bt *BranchesTable) IndexedAccess(ctx *sql.Context, lookup sql.IndexLookup) sql.IndexedTable {
+	return &indexedBranchesTable{BranchesTable: bt}
+}
+
+type indexedBranchesTable struct {
+	*BranchesTable
+	refIndexedTable
+	once sync.Once
+	err  error
+}
+
+var _ sql.IndexedTable = (*indexedBranchesTable)(nil)
+
+func (t *indexedBranchesTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	t.once.Do(func() {
+		var refs []ref.DoltRef
+		refs, t.root, t.err = t.branchRefs(ctx)
+		if t.err == nil {
+			t.setRefs(refs)
+		}
+	})
+	if t.err != nil {
+		return nil, t.err
+	}
+	return t.refIndexedTable.LookupPartitions(ctx, lookup)
+}
+
+func (t *indexedBranchesTable) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.RowIter, error) {
+	p := part.(*refPartition)
+	refs := p.refs
+	if p.reverse {
+		refs = slices.Clone(refs)
+		slices.Reverse(refs)
+	}
+	return newBranchItrForRefs(ctx, t.BranchesTable, refs, t.root)
+}
+
+// BranchNameIndex is the virtual name index for branches and remote branches.
+type BranchNameIndex struct {
+	refNameIndex
+}
+
+// GetIndexes implements sql.IndexAddressable.
+func (bt *BranchesTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
+	return []sql.Index{&BranchNameIndex{refNameIndex{bt.db.Name(), bt.Name(), "name", doltBranchesIndexName}}}, nil
+}
+
+// PreciseMatch implements sql.IndexAddressable.
+func (bt *BranchesTable) PreciseMatch() bool { return true }
+
+// CreateIndexForForeignKey implements sql.ForeignKeyTable
+func (bt *BranchesTable) CreateIndexForForeignKey(ctx *sql.Context, indexDef sql.IndexDef) error {
+	return fmt.Errorf("creating indexes on dolt system tables is not supported")
+}
+
+// GetDeclaredForeignKeys implements sql.ForeignKeyTable
+func (bt *BranchesTable) GetDeclaredForeignKeys(ctx *sql.Context) ([]sql.ForeignKeyConstraint, error) {
+	// The dolt_branches system table does not declare any FKs
+	return nil, nil
+}
+
+// GetReferencedForeignKeys implements sql.ForeignKeyTable
+func (bt *BranchesTable) GetReferencedForeignKeys(ctx *sql.Context) ([]sql.ForeignKeyConstraint, error) {
+	databaseName := bt.db.Name()
+	doltSession := dsess.DSessFromSess(ctx.Session)
+	roots, ok := doltSession.GetRoots(ctx, databaseName)
+	if !ok {
+		return nil, fmt.Errorf("unable to get roots for database '%s'", databaseName)
+	}
+
+	pkSch := sql.NewPrimaryKeySchema(bt.Schema(ctx), 0)
+	tableName := doltdb.TableName{Name: "dolt_branches"}
+	doltSchema, err := sqlutil.ToDoltSchema(ctx, roots.Working, tableName, pkSch, roots.Head, bt.Collation())
+	if err != nil {
+		return nil, err
+	}
+
+	return fk.GetReferencedForeignKeys(ctx, roots.Working, bt.db.Name(), tableName, doltSchema)
+}
+
+// AddForeignKey implements sql.ForeignKeyTable
+func (bt *BranchesTable) AddForeignKey(ctx *sql.Context, fk sql.ForeignKeyConstraint) error {
+	return fmt.Errorf("dolt system tables do not support adding foreign keys")
+}
+
+// DropForeignKey implements sql.ForeignKeyTable
+func (bt *BranchesTable) DropForeignKey(ctx *sql.Context, fkName string, tableName string, schemaName string) error {
+	return fmt.Errorf("dolt system tables do not support dropping foreign keys")
+}
+
+// UpdateForeignKey implements sql.ForeignKeyTable
+func (bt *BranchesTable) UpdateForeignKey(ctx *sql.Context, fkName string, fk sql.ForeignKeyConstraint) error {
+	return fmt.Errorf("dolt_branches system table does not support updating foreign keys")
+}
+
+// GetForeignKeyEditor implements sql.ForeignKeyTable
+func (bt *BranchesTable) GetForeignKeyEditor(ctx *sql.Context) sql.ForeignKeyEditor {
+	return &systemTableForeignKeyEditor{
+		indexedTable: bt.IndexedAccess(ctx, sql.IndexLookup{}),
+	}
+}
+
+// NewBranchesTable creates a BranchesTable
+func NewBranchesTable(_ *sql.Context, db dsess.SqlDatabase, tableName string) sql.Table {
+	return &BranchesTable{db: db, tableName: tableName}
+}
+
+// NewRemoteBranchesTable creates a BranchesTable with only remote refs
+func NewRemoteBranchesTable(_ *sql.Context, ddb dsess.SqlDatabase, tableName string) sql.Table {
+	return &BranchesTable{db: ddb, remote: true, tableName: tableName}
+}
+
+func (bt *BranchesTable) DataLength(ctx *sql.Context) (uint64, error) {
+	numBytesPerRow := schema.SchemaAvgLength(bt.Schema(ctx))
+	numRows, _, err := bt.RowCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return numBytesPerRow * numRows, nil
+}
+
+func (bt *BranchesTable) RowCount(_ *sql.Context) (uint64, bool, error) {
+	return branchesDefaultRowCount, false, nil
+}
+
+// Name is a sql.Table interface function which returns the name of the table
+func (bt *BranchesTable) Name() string {
+	return bt.tableName
+}
+
+// String is a sql.Table interface function which returns the name of the table
+func (bt *BranchesTable) String() string {
+	return bt.tableName
+}
+
+// Schema is a sql.Table interface function that gets the sql.Schema of the branches system table
+func (bt *BranchesTable) Schema(ctx *sql.Context) sql.Schema {
+	columns := []*sql.Column{
+		{Name: "name", Type: types.Text, Source: bt.tableName, PrimaryKey: true, Nullable: false, DatabaseSource: bt.db.Name()},
+		{Name: "hash", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: false, DatabaseSource: bt.db.Name()},
+		{Name: "latest_committer", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+		{Name: "latest_committer_email", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+		{Name: "latest_commit_date", Type: types.Datetime3, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+		{Name: "latest_commit_message", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+	}
+	if !bt.remote {
+		columns = append(columns, &sql.Column{Name: "remote", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true})
+		columns = append(columns, &sql.Column{Name: "branch", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true})
+		columns = append(columns, &sql.Column{Name: "dirty", Type: types.Boolean, Source: bt.tableName, PrimaryKey: false, Nullable: true})
+	}
+	columns = append(columns,
+		&sql.Column{Name: "latest_author", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+		&sql.Column{Name: "latest_author_email", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+		&sql.Column{Name: "latest_author_date", Type: types.Datetime3, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+	)
+	return columns
+}
+
+// Collation implements the sql.Table interface.
+func (bt *BranchesTable) Collation() sql.CollationID {
+	return sql.Collation_Default
+}
+
+// Partitions is a sql.Table interface function that returns a partition of the data.  Currently the data is unpartitioned.
+func (bt *BranchesTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
+	return index.SinglePartitionIterFromNomsMap(nil), nil
+}
+
+// PartitionRows is a sql.Table interface function that gets a row iterator for a partition
+func (bt *BranchesTable) PartitionRows(sqlCtx *sql.Context, _ sql.Partition) (sql.RowIter, error) {
+	return NewBranchItr(sqlCtx, bt)
+}
+
+// BranchItr is a sql.RowItr implementation which iterates over each commit as if it's a row in the table.
+type BranchItr struct {
+	table    *BranchesTable
+	branches []string
+	commits  []*doltdb.Commit
+	dirty    []bool
+	idx      int
+}
+
+// NewBranchItr creates a BranchItr from the current environment.
+func NewBranchItr(ctx *sql.Context, table *BranchesTable) (*BranchItr, error) {
+	branchRefs, root, err := table.branchRefs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newBranchItrForRefs(ctx, table, branchRefs, root)
+}
+
+func (bt *BranchesTable) branchRefs(ctx *sql.Context) ([]ref.DoltRef, hash.Hash, error) {
+	root, err := dsess.TransactionRoot(ctx, bt.db)
+	if err != nil {
+		return nil, root, err
+	}
+	refType := ref.BranchRefType
+	if bt.remote {
+		refType = ref.RemoteRefType
+	}
+	refs, err := bt.db.DbData().Ddb.GetRefsOfTypeByNomsRoot(ctx, map[ref.RefType]struct{}{refType: {}}, root)
+	return refs, root, err
+}
+
+// newBranchItrForRefs resolves only the selected branches, including their dirty
+// state, against the same transaction root used to select their names.
+func newBranchItrForRefs(ctx *sql.Context, table *BranchesTable, branchRefs []ref.DoltRef, txRoot hash.Hash) (*BranchItr, error) {
+	ddb := table.db.DbData().Ddb
+	remote := table.remote
+
+	branchNames := make([]string, len(branchRefs))
+	commits := make([]*doltdb.Commit, len(branchRefs))
+	dirtyBits := make([]bool, len(branchRefs))
+	for i, branch := range branchRefs {
+		commit, err := ddb.ResolveCommitRefAtRoot(ctx, branch, txRoot)
+		if err != nil {
+			return nil, err
+		}
+
+		var dirty bool
+		if !remote {
+			dirty, err = isDirty(ctx, ddb, commit, branch, txRoot)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		branchNames[i] = refSQLName(branch)
+
+		dirtyBits[i] = dirty
+		commits[i] = commit
+	}
+
+	return &BranchItr{
+		table:    table,
+		branches: branchNames,
+		commits:  commits,
+		dirty:    dirtyBits,
+		idx:      0,
+	}, nil
+}
+
+// Next retrieves the next row. It will return io.EOF if it's the last row.
+// After retrieving the last row, Close will be automatically closed.
+func (itr *BranchItr) Next(ctx *sql.Context) (sql.Row, error) {
+	defer func() {
+		itr.idx++
+	}()
+
+	if itr.idx >= len(itr.commits) {
+		return nil, io.EOF
+	}
+
+	name := itr.branches[itr.idx]
+
+	cm := itr.commits[itr.idx]
+	dirty := itr.dirty[itr.idx]
+	meta, err := cm.GetCommitMeta(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	h, err := cm.HashOf()
+	if err != nil {
+		return nil, err
+	}
+
+	remoteBranches := itr.table.remote
+	if remoteBranches {
+		return sql.NewRow(name, h.String(), meta.Committer.Name, meta.Committer.Email, meta.Committer.Date.Time(), meta.Description, meta.Author.Name, meta.Author.Email, meta.Author.Date.Time()), nil
+	} else {
+		branches, err := itr.table.db.DbData().Rsr.GetBranches()
+		if err != nil {
+			return nil, err
+		}
+
+		remoteName := ""
+		branchName := ""
+		branch, ok := branches.Get(name)
+		if ok {
+			remoteName = branch.Remote
+			branchName = branch.Merge.Ref.GetPath()
+		}
+		return sql.NewRow(name, h.String(), meta.Committer.Name, meta.Committer.Email, meta.Committer.Date.Time(), meta.Description, remoteName, branchName, dirty, meta.Author.Name, meta.Author.Email, meta.Author.Date.Time()), nil
+	}
+}
+
+// isDirty returns true if the working ref points to a dirty branch.
+func isDirty(ctx *sql.Context, ddb *doltdb.DoltDB, commit *doltdb.Commit, branch ref.DoltRef, txRoot hash.Hash) (bool, error) {
+	wsRef, err := ref.WorkingSetRefForHead(branch)
+	if err != nil {
+		return false, err
+	}
+	ws, err := ddb.ResolveWorkingSetAtRoot(ctx, wsRef, txRoot)
+	if err != nil {
+		if errors.Is(err, doltdb.ErrWorkingSetNotFound) {
+			// If there is no working set for this branch, then it is never dirty. This happens on servers commonly.
+			return false, nil
+		}
+		return false, err
+	}
+
+	workingRoot := ws.WorkingRoot()
+	workingRootHash, err := workingRoot.HashOf()
+	if err != nil {
+		return false, err
+	}
+	stagedRoot := ws.StagedRoot()
+	stagedRootHash, err := stagedRoot.HashOf()
+	if err != nil {
+		return false, err
+	}
+
+	dirty := false
+	if workingRootHash != stagedRootHash {
+		dirty = true
+	} else {
+		cmRt, err := commit.GetRootValue(ctx)
+		if err != nil {
+			return false, err
+		}
+		cmRtHash, err := cmRt.HashOf()
+		if err != nil {
+			return false, err
+		}
+		if cmRtHash != workingRootHash {
+			dirty = true
+		}
+	}
+	return dirty, nil
+}
+
+// Close closes the iterator.
+func (itr *BranchItr) Close(*sql.Context) error {
+	return nil
+}
+
+// Replacer returns a RowReplacer for this table. The RowReplacer will have Insert and optionally Delete called once
+// for each row, followed by a call to Close() when all rows have been processed.
+func (bt *BranchesTable) Replacer(ctx *sql.Context) sql.RowReplacer {
+	return branchWriter{bt}
+}
+
+// Updater returns a RowUpdater for this table. The RowUpdater will have Update called once for each row to be
+// updated, followed by a call to Close() when all rows have been processed.
+func (bt *BranchesTable) Updater(ctx *sql.Context) sql.RowUpdater {
+	return branchWriter{bt}
+}
+
+// Inserter returns an Inserter for this table. The Inserter will get one call to Insert() for each row to be
+// inserted, and will end with a call to Close() to finalize the insert operation.
+func (bt *BranchesTable) Inserter(*sql.Context) sql.RowInserter {
+	return branchWriter{bt}
+}
+
+// Deleter returns a RowDeleter for this table. The RowDeleter will get one call to Delete for each row to be deleted,
+// and will end with a call to Close() to finalize the delete operation.
+func (bt *BranchesTable) Deleter(*sql.Context) sql.RowDeleter {
+	return branchWriter{bt}
+}
+
+var _ sql.RowReplacer = branchWriter{nil}
+var _ sql.RowUpdater = branchWriter{nil}
+var _ sql.RowInserter = branchWriter{nil}
+var _ sql.RowDeleter = branchWriter{nil}
+
+type branchWriter struct {
+	bt *BranchesTable
+}
+
+// Insert inserts the row given, returning an error if it cannot. Insert will be called once for each row to process
+// for the insert operation, which may involve many rows. After all rows in an operation have been processed, Close
+// is called.
+func (bWr branchWriter) Insert(ctx *sql.Context, r sql.Row) error {
+	return fmt.Errorf("the dolt_branches table is read-only; use the dolt_branch stored procedure to edit remotes")
+}
+
+// Update the given row. Provides both the old and new rows.
+func (bWr branchWriter) Update(ctx *sql.Context, old sql.Row, new sql.Row) error {
+	return fmt.Errorf("the dolt_branches table is read-only; use the dolt_branch stored procedure to edit remotes")
+}
+
+// Delete deletes the given row. Returns ErrDeleteRowNotFound if the row was not found. Delete will be called once for
+// each row to process for the delete operation, which may involve many rows. After all rows have been processed,
+// Close is called.
+func (bWr branchWriter) Delete(ctx *sql.Context, r sql.Row) error {
+	return fmt.Errorf("the dolt_branches table is read-only; use the dolt_branch stored procedure to edit remotes")
+}
+
+// StatementBegin implements the interface sql.TableEditor. Currently a no-op.
+func (bWr branchWriter) StatementBegin(ctx *sql.Context) {}
+
+// DiscardChanges implements the interface sql.TableEditor. Currently a no-op.
+func (bWr branchWriter) DiscardChanges(ctx *sql.Context, errorEncountered error) error {
+	return nil
+}
+
+// StatementComplete implements the interface sql.TableEditor. Currently a no-op.
+func (bWr branchWriter) StatementComplete(ctx *sql.Context) error {
+	return nil
+}
+
+// Close finalizes the delete operation, persisting the result.
+func (bWr branchWriter) Close(*sql.Context) error {
+	return nil
+}

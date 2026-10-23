@@ -1,0 +1,4 @@
+[submodule "integration-tests/mysql-client-tests/cpp/third_party/mysql-connector-cpp"]
+	path = integration-tests/mysql-client-tests/cpp/third_party/mysql-connector-cpp
+	url = https://github.com/mysql/mysql-connector-cpp.git
+	ignore = dirty

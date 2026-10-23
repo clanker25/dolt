@@ -1,0 +1,518 @@
+// Copyright 2022 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package enginetest
+
+import (
+	"github.com/dolthub/go-mysql-server/enginetest/queries"
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/go-mysql-server/testutils"
+)
+
+var _ testutils.CustomValueValidator = &doltCommitValidator{}
+
+var NonlocalScripts = []queries.ScriptTest{
+	{
+		Name: "basic nonlocal tables use case",
+		SetUpScript: []string{
+			"CALL DOLT_BRANCH('other')",
+			"CREATE TABLE aliased_table (pk char(8) PRIMARY KEY);",
+			"INSERT INTO aliased_table VALUES ('amzmapqt');",
+			"CALL dolt_checkout('other');",
+			`INSERT INTO dolt_nonlocal_tables(table_name, target_ref, ref_table, options) VALUES
+				('nonlocal_table', 'main', 'aliased_table', 'immediate')`,
+			`INSERT INTO nonlocal_table VALUES ('eesekkgo');`,
+			`CREATE TABLE local_table (pk char(8) PRIMARY KEY, FOREIGN KEY (pk) REFERENCES nonlocal_table(pk));`,
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from nonlocal_table;",
+				Expected: []sql.Row{{"amzmapqt"}, {"eesekkgo"}},
+			},
+			{
+				Query:    "select * from `mydb/main`.aliased_table;",
+				Expected: []sql.Row{{"amzmapqt"}, {"eesekkgo"}},
+			},
+			{
+				Query:    "show create table nonlocal_table;",
+				Expected: []sql.Row{{"aliased_table", "CREATE TABLE `aliased_table` (\n  `pk` char(8) NOT NULL,\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+			{
+				Query:    "show create table local_table;",
+				Expected: []sql.Row{{"local_table", "CREATE TABLE `local_table` (\n  `pk` char(8) NOT NULL,\n  PRIMARY KEY (`pk`),\n  CONSTRAINT `local_table_ibfk_1` FOREIGN KEY (`pk`) REFERENCES `nonlocal_table` (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+			{
+				Query:       `INSERT INTO local_table VALUES ("amzmapqt");`,
+				ExpectedErr: nil,
+			},
+			{
+				Query:          `INSERT INTO local_table VALUES ("fdnfjfjf");`,
+				ExpectedErrStr: "cannot add or update a child row - Foreign key violation on fk: `local_table_ibfk_1`, table: `local_table`, referenced table: `nonlocal_table`, key: `[fdnfjfjf]`",
+			},
+			{
+				Query:    `CALL DOLT_VERIFY_CONSTRAINTS('--all');`,
+				Expected: []sql.Row{{0}},
+			},
+		},
+	},
+	{
+		Name: "detect foreign key invalidation is detected when rows are removed",
+		SetUpScript: []string{
+			"CALL DOLT_BRANCH('other')",
+			"CREATE TABLE aliased_table (pk char(8) PRIMARY KEY);",
+			"INSERT INTO aliased_table VALUES ('amzmapqt');",
+			"CALL dolt_checkout('other');",
+			`INSERT INTO dolt_nonlocal_tables(table_name, target_ref, ref_table, options) VALUES
+				('nonlocal_table', 'main', 'aliased_table', 'immediate')`,
+			`CREATE TABLE local_table (pk char(8) PRIMARY KEY, FOREIGN KEY (pk) REFERENCES nonlocal_table(pk));`,
+			"INSERT INTO local_table VALUES ('amzmapqt');",
+			"DELETE FROM `mydb/main`.aliased_table;",
+			"set @@dolt_force_transaction_commit=1",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_VERIFY_CONSTRAINTS('--all');",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "SELECT violation_type FROM dolt_constraint_violations_local_table",
+				Expected: []sql.Row{{"foreign key"}},
+			},
+			{
+				// Check that neither command removed the FK relation (this can happen if it thinks the child table was dropped)
+				Query:    "SHOW CREATE TABLE local_table;",
+				Expected: []sql.Row{{"local_table", "CREATE TABLE `local_table` (\n  `pk` char(8) NOT NULL,\n  PRIMARY KEY (`pk`),\n  CONSTRAINT `local_table_ibfk_1` FOREIGN KEY (`pk`) REFERENCES `nonlocal_table` (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+		},
+	},
+	{
+		Name: "detect foreign key invalidation is detected when the nonlocal table is dropped",
+		// DOLT_VERIFY_CONSTRAINTS detects constraint violations by attempting a merge against HEAD.
+		// The current behavior for merges is to delete FK constraints if a table doesn't exist after the merge.
+		// This is a bug with DOLT_VERIFY_CONSTRAINTS, not with nonlocal_tables. As a workaround,
+		// the `dolt constraints verify` CLI command can detect these violations, which we confirm via nonlocal.bats
+		Skip: true,
+		SetUpScript: []string{
+			"CREATE DATABASE IF NOT EXISTS mydb",
+			"USE mydb",
+			"CALL DOLT_BRANCH('other')",
+			"CREATE TABLE aliased_table (pk char(8) PRIMARY KEY);",
+			"INSERT INTO aliased_table VALUES ('amzmapqt');",
+			"CALL dolt_checkout('other');",
+			`INSERT INTO dolt_nonlocal_tables(table_name, target_ref, ref_table, options) VALUES
+				('nonlocal_table', 'main', 'aliased_table', 'immediate')`,
+			`CREATE TABLE local_table (pk char(8) PRIMARY KEY, FOREIGN KEY (pk) REFERENCES nonlocal_table(pk));`,
+			"INSERT INTO local_table VALUES ('amzmapqt');",
+			"DROP TABLE `mydb/main`.aliased_table;",
+			"set @@dolt_force_transaction_commit=1",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_VERIFY_CONSTRAINTS('--all');",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "SELECT violation_type FROM dolt_constraint_violations_local_table",
+				Expected: []sql.Row{{"foreign key"}},
+			},
+			{
+				// Check that neither command removed the FK relation (this can happen if it thinks the child table was dropped)
+				Query:    "SHOW CREATE TABLE local_table;",
+				Expected: []sql.Row{{"local_table", "CREATE TABLE `local_table` (\n  `pk` char(8) NOT NULL,\n  PRIMARY KEY (`pk`),\n  CONSTRAINT `local_table_ibfk_1` FOREIGN KEY (`pk`) REFERENCES `nonlocal_table` (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+		},
+	},
+	{
+		Name: "creating a table matching a nonlocal table rule results in an error",
+		SetUpScript: []string{
+			`INSERT INTO dolt_nonlocal_tables(table_name, target_ref, options) VALUES
+				("nonlocal_table", "main", "immediate")`,
+			"CALL DOLT_COMMIT('-Am', 'add nonlocal rule')",
+			"CALL DOLT_BRANCH('other')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_CHECKOUT('other');",
+				Expected: []sql.Row{{0, "Switched to branch 'other'"}},
+			},
+			{
+				Query:          "CREATE TABLE nonlocal_table (pk char(8) PRIMARY KEY);",
+				ExpectedErrStr: "Cannot create table name nonlocal_table because it matches a name present in dolt_nonlocal_tables.",
+			},
+		},
+	},
+	// https://github.com/dolthub/dolt/issues/11995
+	{
+		Name: "creating a table matching a nonlocal table rule is only allowed on the rule's target branch",
+		SetUpScript: []string{
+			`INSERT INTO dolt_nonlocal_tables (table_name, target_ref, options) VALUES
+				('global_*', 'main', 'immediate')`,
+			"CALL DOLT_COMMIT('-Am', 'add nonlocal rule');",
+			"CALL DOLT_BRANCH('other');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CREATE TABLE global_a (id INT PRIMARY KEY);",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "CREATE TABLE global_b (id INT, CONSTRAINT pk_b PRIMARY KEY (id));",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "CALL DOLT_CHECKOUT('other');",
+				Expected: []sql.Row{{0, "Switched to branch 'other'"}},
+			},
+			{
+				Query:          "CREATE TABLE global_c (id INT PRIMARY KEY);",
+				ExpectedErrStr: "Cannot create table name global_c because it matches a name present in dolt_nonlocal_tables.",
+			},
+			{
+				Query:          "CREATE TABLE global_d (id INT, CONSTRAINT pk_d PRIMARY KEY (id));",
+				ExpectedErrStr: "Cannot create table name global_d because it matches a name present in dolt_nonlocal_tables.",
+			},
+		},
+	},
+	// https://github.com/dolthub/dolt/issues/12039
+	{
+		Name: "CREATE TABLE IF NOT EXISTS for existing nonlocal table succeeds on non-target branch",
+		SetUpScript: []string{
+			`CREATE TABLE global_migrations_history (
+  migration_id varchar(150) NOT NULL,
+  product_version varchar(32) NOT NULL,
+  CONSTRAINT pk_global_migrations_history PRIMARY KEY (migration_id)
+);`,
+			`INSERT INTO dolt_nonlocal_tables (table_name, target_ref, options) VALUES ('global_*', 'main', 'immediate');`,
+			`INSERT INTO dolt_ignore (pattern, ignored) VALUES ('global_*', true);`,
+			`CALL DOLT_COMMIT('-Am', 'share global_* tables across branches');`,
+			`INSERT INTO global_migrations_history VALUES ('20240101000000_Initial', '10.0.0');`,
+			`CALL DOLT_BRANCH('schema');`,
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: `CREATE TABLE IF NOT EXISTS global_migrations_history (
+  migration_id varchar(150) NOT NULL,
+  product_version varchar(32) NOT NULL,
+  CONSTRAINT pk_global_migrations_history PRIMARY KEY (migration_id)
+);`,
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "CALL DOLT_CHECKOUT('schema');",
+				Expected: []sql.Row{{0, "Switched to branch 'schema'"}},
+			},
+			{
+				Query:    "SELECT * FROM global_migrations_history;",
+				Expected: []sql.Row{{"20240101000000_Initial", "10.0.0"}},
+			},
+			{
+				Query:    "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'global_migrations_history';",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query: `CREATE TABLE IF NOT EXISTS global_migrations_history (
+  migration_id varchar(150) NOT NULL,
+  product_version varchar(32) NOT NULL,
+  CONSTRAINT pk_global_migrations_history PRIMARY KEY (migration_id)
+);`,
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+		},
+	},
+	{
+		Name: "creating a table matching a nonlocal table rule with ref_table set or a frozen tag target is rejected on the target branch",
+		SetUpScript: []string{
+			"CALL DOLT_TAG('v1')",
+			`INSERT INTO dolt_nonlocal_tables(table_name, target_ref, ref_table, options) VALUES
+				("renamed_*", "main", "other_name", "immediate"),
+				("tagged_*", "v1", "", "immediate")`,
+			"CALL DOLT_COMMIT('-Am', 'add nonlocal rules')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CREATE TABLE renamed_a (id INT PRIMARY KEY);",
+				ExpectedErrStr: "Cannot create table name renamed_a because it matches a name present in dolt_nonlocal_tables.",
+			},
+			{
+				Query:          "CREATE TABLE tagged_a (id INT PRIMARY KEY);",
+				ExpectedErrStr: "Cannot create table name tagged_a because it matches a name present in dolt_nonlocal_tables.",
+			},
+		},
+	},
+	{
+		Name: "nonlocal tables appear in 'show tables'",
+		SetUpScript: []string{
+			"CALL DOLT_BRANCH('other')",
+			"CREATE TABLE aliased_table (pk char(8) PRIMARY KEY);",
+			"CREATE TABLE table_alias_1 (pk char(8) PRIMARY KEY);",
+			"CREATE TABLE table_alias_wild_3 (pk char(8) PRIMARY KEY);",
+			"INSERT INTO aliased_table VALUES ('amzmapqt');",
+			"CALL dolt_checkout('other');",
+			`INSERT INTO dolt_nonlocal_tables(table_name, target_ref, ref_table, options) VALUES
+				("table_alias_1", "main", "", "immediate"),
+				("table_alias_2", "main", "aliased_table", "immediate"),
+				("table_alias_wild_*", "main", "", "immediate"),
+				("table_alias_missing", "main", "", "immediate");`,
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "show tables",
+				Expected: []sql.Row{{"table_alias_1"}, {"table_alias_2"}, {"table_alias_wild_3"}},
+			},
+		},
+	},
+	{
+		Name: "detect invalid options",
+		SetUpScript: []string{
+			"CALL dolt_checkout('-b', 'other');",
+			`INSERT INTO dolt_nonlocal_tables(table_name, target_ref, options) VALUES
+				("nonlocal_table", "main", "invalid");`,
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "select * from nonlocal_table;",
+				ExpectedErrStr: "Invalid nonlocal table options invalid: only valid value is 'immediate'.",
+			},
+		},
+	},
+	{
+		Name: "nonlocal table appears once in show tables when local table exists",
+		SetUpScript: []string{
+			"CREATE TABLE foo (id int auto_increment primary key);",
+			"CALL dolt_commit('-Am', 'create table foo');",
+			"CALL dolt_branch('test');",
+			"INSERT INTO foo values (1);",
+			`INSERT INTO dolt_nonlocal_tables (table_name, target_ref, options) VALUES ('foo', 'main', 'immediate');`,
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "show tables;",
+				Expected: []sql.Row{{"foo"}},
+			},
+			{
+				Query: "call dolt_checkout('test');",
+			},
+			// TODO(elianddb): Add an indicator that the current local table (not part of the target reference for the
+			//  non-local pattern) is currently shadowed. This would provide actionable feedback, but for now only show
+			//  a singular name for the non-local table, as it's the only queryable one.
+			{
+				Query:    "show tables;",
+				Expected: []sql.Row{{"foo"}},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/11997
+		Name: "schema override permits ignored nonlocal tables",
+		SetUpScript: []string{
+			"CALL dolt_tag('empty_schema');",
+			"CREATE TABLE global_test (id int primary key, name varchar(100), INDEX (name));",
+			"INSERT INTO global_test VALUES (1, 'one'), (2, NULL);",
+			"CREATE TABLE global_empty (id int primary key);",
+			"CREATE TABLE local_only (id int primary key);",
+			"INSERT INTO dolt_ignore VALUES ('global_*', true), ('local_only', true);",
+			"INSERT INTO dolt_nonlocal_tables (table_name, target_ref, options) VALUES ('global_*', 'main', 'immediate');",
+			"CALL dolt_commit('-Am', 'configure nonlocal tables');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SET @@dolt_override_schema='main';",
+			},
+			{
+				Query:    "SELECT COUNT(*) FROM global_test;",
+				Expected: []sql.Row{{2}},
+			},
+			{
+				Query:    "SELECT * FROM global_test ORDER BY id;",
+				Expected: []sql.Row{{1, "one"}, {2, nil}},
+			},
+			{
+				Query:    "SELECT id FROM global_test WHERE name = 'one';",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "SELECT * FROM global_empty;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:          "SELECT * FROM local_only;",
+				ExpectedErrStr: "unable to find table 'local_only' at overridden schema root",
+			},
+			{
+				Query: "SET @@dolt_override_schema='empty_schema';",
+			},
+			{
+				Query:    "SELECT COUNT(*) FROM global_test;",
+				Expected: []sql.Row{{2}},
+			},
+			{
+				Query: "SET @@dolt_override_schema='doesNotExist';",
+			},
+			{
+				Query:          "SELECT * FROM global_test;",
+				ExpectedErrStr: "unable to resolve schema override value: branch not found: doesNotExist",
+			},
+		},
+	},
+	{
+		Name: "schema override permits ignored nonlocal aliases on another branch",
+		SetUpScript: []string{
+			"INSERT INTO dolt_ignore VALUES ('global_*', true);",
+			"INSERT INTO dolt_nonlocal_tables (table_name, target_ref, ref_table, options) VALUES ('alias', 'main', 'global_test', 'immediate');",
+			"CALL dolt_commit('-Am', 'configure nonlocal alias');",
+			"CALL dolt_branch('other');",
+			"CREATE TABLE global_test (id int primary key, name varchar(100));",
+			"INSERT INTO global_test VALUES (1, 'one');",
+			"CALL dolt_checkout('other');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SET @@dolt_override_schema='main';",
+			},
+			{
+				Query:    "SELECT * FROM alias;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				Query:          "SELECT * FROM `mydb/main`.global_test;",
+				ExpectedErrStr: "unable to find table 'global_test' at overridden schema root",
+			},
+		},
+	},
+	{
+		// TODO: Support schema-qualified override lookups and PostgreSQL string conversion in Doltgres.
+		Dialect: "mysql",
+		Name:    "schema override maps committed nonlocal tables",
+		SetUpScript: []string{
+			"CALL dolt_tag('empty_schema');",
+			"CREATE TABLE target (id int primary key, name varchar(100));",
+			"INSERT INTO target VALUES (1, 'one');",
+			"CALL dolt_commit('-Am', 'create target');",
+			"CALL dolt_tag('original');",
+			"ALTER TABLE target ADD COLUMN extra int;",
+			"INSERT INTO target VALUES (2, 'two', 20);",
+			"CALL dolt_commit('-am', 'extend target');",
+			"CALL dolt_checkout('-b', 'other');",
+			"INSERT INTO dolt_nonlocal_tables (table_name, target_ref, ref_table, options) VALUES ('alias', 'main', 'target', 'immediate'), ('tag_alias', 'original', 'target', 'immediate');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SET @@dolt_override_schema='original';",
+			},
+			{
+				Query:    "SELECT * FROM alias ORDER BY id;",
+				Expected: []sql.Row{{1, "one"}, {2, "two"}},
+			},
+			{
+				Query:    "SELECT * FROM tag_alias;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				Query: "SET @@dolt_override_schema='empty_schema';",
+			},
+			{
+				Query:    "SELECT * FROM tag_alias;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				Query:    "SELECT * FROM alias ORDER BY id;",
+				Expected: []sql.Row{{1, "one", nil}, {2, "two", 20}},
+			},
+		},
+	},
+	{
+		Name: "conflict updates use the local backing table despite a nonlocal rule",
+		SetUpScript: []string{
+			"CREATE TABLE target (id int primary key, value int);",
+			"INSERT INTO target VALUES (1, 0);",
+			"CALL dolt_commit('-Am', 'create target');",
+			"CALL dolt_checkout('-b', 'other');",
+			"UPDATE target SET value = 10;",
+			"CALL dolt_commit('-am', 'other value');",
+			"CALL dolt_checkout('main');",
+			"UPDATE target SET value = 20;",
+			"CALL dolt_commit('-am', 'main value');",
+			"SET @@dolt_force_transaction_commit = 1;",
+			"CALL dolt_merge('other');",
+			"INSERT INTO dolt_nonlocal_tables (table_name, target_ref, options) VALUES ('target', 'other', 'immediate');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT base_value, our_value, their_value FROM dolt_conflicts_target;",
+				Expected: []sql.Row{{0, 20, 10}},
+			},
+			{
+				Query:    "SELECT value FROM target;",
+				Expected: []sql.Row{{10}},
+			},
+			{
+				Query: "UPDATE dolt_conflicts_target SET our_value = 30 WHERE our_id = 1;",
+			},
+			{
+				Query: "DELETE FROM dolt_nonlocal_tables WHERE table_name = 'target';",
+			},
+			{
+				Query:    "SELECT value FROM target;",
+				Expected: []sql.Row{{30}},
+			},
+			{
+				Query:    "SELECT value FROM `mydb/other`.target;",
+				Expected: []sql.Row{{10}},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/10462
+		Name: "nonlocal table is not affected by dolt_clean()",
+		SetUpScript: []string{
+			"CREATE TABLE global_test (id int auto_increment primary key, name varchar(100));",
+			"INSERT INTO global_test (id, name) VALUES (1, 'one');",
+			"CREATE TABLE foo (id int auto_increment primary key);",
+			"INSERT INTO dolt_nonlocal_tables (table_name, target_ref, options) VALUES ('global_*', 'main', 'immediate');",
+			"CALL dolt_add('dolt_nonlocal_tables');",
+			"CALL dolt_commit('-m', 'set up dolt_nonlocal_tables');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * FROM global_test;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				Query:    "CALL dolt_clean();",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT * FROM global_test;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{{"global_test"}},
+			},
+			{
+				Query:    "CALL dolt_clean('-x')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT * FROM global_test;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{{"global_test"}},
+			},
+		},
+	},
+}

@@ -1,0 +1,204 @@
+// Copyright 2024 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package writer
+
+import (
+	"fmt"
+
+	"github.com/dolthub/go-mysql-server/sql"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/expranalysis"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
+	"github.com/dolthub/dolt/go/store/val"
+)
+
+// writerSchema returns the state required to map logical sql.Row values to
+// primary and secondary val.Tuple that will be written to disk.
+func writerSchema(ctx *sql.Context, t *doltdb.Table, tableName doltdb.TableName, dbName string) (*dsess.WriterState, error) {
+	sess, ok := ctx.Session.(*dsess.DoltSession)
+	if !ok {
+		return newWriterSchema(ctx, t, tableName, dbName)
+	}
+
+	dbState, ok, err := sess.LookupDbState(ctx, dbName)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("no state for database %s", dbName)
+	}
+
+	// cannot use root value schema cache, |t| is not in root value
+	schHash, err := t.GetSchemaHash(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	schKey := doltdb.DataCacheKey{Hash: schHash}
+	schState, ok := dbState.SessionCache().GetCachedWriterState(schKey)
+	if !ok {
+		schState, err = newWriterSchema(ctx, t, tableName, dbName)
+		if err != nil {
+			return nil, err
+		}
+		if !schKey.IsEmpty() {
+			dbState.SessionCache().CacheWriterState(schKey, schState)
+		}
+	}
+	return schState, nil
+}
+
+func newWriterSchema(ctx *sql.Context, t *doltdb.Table, tableName doltdb.TableName, dbName string) (*dsess.WriterState, error) {
+	var err error
+	schState := new(dsess.WriterState)
+	schState.DoltSchema, err = t.GetSchema(ctx)
+	if err != nil {
+		return nil, err
+	}
+	schState.PkKeyDesc, schState.PkValDesc = schState.DoltSchema.GetMapDescriptors(t.NodeStore())
+	schState.PkSchema, err = sqlutil.FromDoltSchema(ctx, dbName, tableName.Name, schState.DoltSchema)
+	if err != nil {
+		return nil, err
+	}
+
+	schState.AutoIncCol = autoIncrementColFromSchema(schState.DoltSchema)
+
+	// Resolved once for the whole table: rows read directly from stored data omit virtual columns
+	// entirely, so any write path that needs a virtual column's value evaluates these to fill it in.
+	schState.VirtualExpressions, err = resolveVirtualExpressions(ctx, tableName.Name, schState.DoltSchema)
+	if err != nil {
+		return nil, err
+	}
+
+	keyMap, valMap := ordinalMappingsFromSchema(schState.PkSchema.Schema, schState.DoltSchema)
+	schState.PriIndex = dsess.IndexState{KeyMapping: keyMap, ValMapping: valMap}
+
+	definitions := schState.DoltSchema.Indexes().AllIndexes()
+	for _, def := range definitions {
+		keyMap, valMap := ordinalMappingsFromSchema(schState.PkSchema.Schema, def.Schema())
+		pkMap := makeIndexToIndexMapping(def.Schema().GetPKCols(), schState.DoltSchema.GetPKCols())
+
+		// A virtual generated column that is a key part of this index is never physically
+		// persisted in the source table, so a writer must recompute its value from the row
+		// rather than trust a pre-populated slot.
+		var keyVirtualExprs []sql.Expression
+		if schState.VirtualExpressions != nil {
+			for i, tag := range def.AllTags() {
+				// PK columns can never be virtual generated columns (MySQL requires STORED).
+				if _, isPk := schState.DoltSchema.GetPKCols().TagToIdx[tag]; isPk {
+					continue
+				}
+				pos, ok := schState.DoltSchema.GetAllCols().TagToIdx[tag]
+				if !ok || schState.VirtualExpressions[pos] == nil {
+					continue
+				}
+				if keyVirtualExprs == nil {
+					keyVirtualExprs = make([]sql.Expression, len(def.AllTags()))
+				}
+				keyVirtualExprs[i] = schState.VirtualExpressions[pos]
+			}
+		}
+
+		idxState := dsess.IndexState{
+			KeyMapping:      keyMap,
+			ValMapping:      valMap,
+			PkMapping:       pkMap,
+			Name:            def.Name(),
+			Schema:          def.Schema(),
+			Count:           def.Count(),
+			IsFullText:      def.IsFullText(),
+			IsUnique:        def.IsUnique(),
+			IsSpatial:       def.IsSpatial(),
+			PrefixLengths:   def.PrefixLengths(),
+			KeyVirtualExprs: keyVirtualExprs,
+		}
+		if predStr := def.Predicate(); predStr != "" {
+			predExpr, err := expranalysis.ResolveExpression(ctx, tableName, predStr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to compile partial index predicate for %s: %w", def.Name(), err)
+			}
+			idxState.Predicate = predExpr
+		}
+		schState.SecIndexes = append(schState.SecIndexes, idxState)
+	}
+	return schState, nil
+}
+
+// resolveVirtualExpressions returns a table's resolved virtual column expressions indexed by column
+// position in the full schema, or nil when the table has no virtual columns.
+func resolveVirtualExpressions(ctx *sql.Context, tableName string, sch schema.Schema) ([]sql.Expression, error) {
+	if !schema.IsVirtual(sch) {
+		return nil, nil
+	}
+	resolved, err := expranalysis.ResolveSchema(ctx, tableName, sch)
+	if err != nil {
+		return nil, err
+	}
+
+	cols := sch.GetAllCols().GetColumns()
+	virtualExpressions := make([]sql.Expression, len(cols))
+	for i, col := range cols {
+		if !col.Virtual {
+			continue
+		}
+		colIdx := resolved.IndexOfColName(col.Name)
+		if colIdx < 0 {
+			return nil, fmt.Errorf("unable to find virtual column %s in resolved schema", col.Name)
+		}
+		virtualExpressions[i] = resolved[colIdx].Generated
+	}
+	return virtualExpressions, nil
+}
+
+func ordinalMappingsFromSchema(from sql.Schema, to schema.Schema) (km, vm val.OrdinalMapping) {
+	km = makeOrdinalMapping(from, to.GetPKCols())
+	vm = makeOrdinalMapping(from, to.GetNonPKCols())
+	return
+}
+
+func makeOrdinalMapping(from sql.Schema, to *schema.ColCollection) (m val.OrdinalMapping) {
+	m = make(val.OrdinalMapping, to.StoredSize())
+	for i := range m {
+		col := to.GetByStoredIndex(i)
+		name := col.Name
+		colIdx := from.IndexOfColName(name)
+		m[i] = colIdx
+	}
+	return
+}
+
+// NB: only works for primary-key tables/indexes
+func makeIndexToIndexMapping(from, to *schema.ColCollection) (m val.OrdinalMapping) {
+	m = make(val.OrdinalMapping, len(to.GetColumns()))
+	for i, col := range to.GetColumns() {
+		m[i] = from.TagToIdx[col.Tag]
+	}
+	return
+}
+
+func autoIncrementColFromSchema(sch schema.Schema) schema.Column {
+	var autoCol schema.Column
+	_ = sch.GetAllCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
+		if col.AutoIncrement {
+			autoCol = col
+			stop = true
+		}
+		return
+	})
+	return autoCol
+}

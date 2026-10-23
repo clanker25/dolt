@@ -1,0 +1,302 @@
+// Copyright 2019 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package commands
+
+import (
+	"context"
+	"path"
+	"sync"
+
+	"github.com/dolthub/dolt/go/cmd/dolt/cli"
+	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
+	"github.com/dolthub/dolt/go/libraries/utils/argparser"
+	"github.com/dolthub/dolt/go/libraries/utils/earl"
+	"github.com/dolthub/dolt/go/store/datas/pull"
+	"github.com/dolthub/dolt/go/store/hash"
+	"github.com/dolthub/dolt/go/store/types"
+)
+
+const (
+	dirParamName = "dir"
+)
+
+var readTablesDocs = cli.CommandDocumentationContent{
+	ShortDesc: "Fetch table(s) at a specific commit into a new dolt repo",
+	LongDesc: "A shallow clone operation will retrieve the state of table(s) from a remote repository at a given commit. " +
+		"Retrieved data is placed into the working state of a newly created local Dolt repository. Changes to the data cannot " +
+		"be submitted back to the remote repository, and the shallow clone cannot be converted into a regular clone of a " +
+		"repository.",
+	Synopsis: []string{
+		"[--dir <directory>] {{.LessThan}}remote-url{{.GreaterThan}} {{.LessThan}}commit{{.GreaterThan}} [{{.LessThan}}table{{.GreaterThan}}...]",
+	},
+}
+
+// ReadTablesCmd is the implementation of the shallow-clone command
+type ReadTablesCmd struct{}
+
+// Name is returns the name of the Dolt cli command. This is what is used on the command line to invoke the command
+func (cmd ReadTablesCmd) Name() string {
+	return "read-tables"
+}
+
+// Description returns a description of the command
+func (cmd ReadTablesCmd) Description() string {
+	return readTablesDocs.ShortDesc
+}
+
+func (cmd ReadTablesCmd) Docs() *cli.CommandDocumentation {
+	ap := cmd.ArgParser()
+	return cli.NewCommandDocumentation(readTablesDocs, ap)
+}
+
+func (cmd ReadTablesCmd) RequiresRepo() bool {
+	return false
+}
+
+func (cmd ReadTablesCmd) ArgParser() *argparser.ArgParser {
+	ap := argparser.NewArgParserWithVariableArgs(cmd.Name())
+	ap.ArgListHelp = [][2]string{
+		{"remote-repo", "Remote repository to retrieve data from"},
+		{"commit", "Branch or commit hash representing a point in time to retrieve tables from"},
+		{"table", " Optional tables to retrieve.  If omitted, all tables are retrieved."},
+	}
+	ap.SupportsString(dirParamName, "d", "directory", "directory to create and put retrieved table data.")
+	ap.SupportsString(gitRefFlag, "", "ref", "Git ref to use as the Dolt data ref for git remotes (default: refs/dolt/data).")
+	return ap
+}
+
+// Exec executes the command
+func (cmd ReadTablesCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
+	ap := cmd.ArgParser()
+
+	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, readTablesDocs, ap))
+	apr := cli.ParseArgsOrDie(ap, args, help)
+
+	if apr.NArg() < 2 {
+		return HandleVErrAndExitCode(errhand.BuildDError("Missing required arguments").SetPrintUsage().Build(), usage)
+	}
+
+	urlStr := apr.Arg(0)
+	commitStr := apr.Arg(1)
+	tblNames := apr.Args[2:]
+
+	_, err := earl.Parse(urlStr)
+
+	if err != nil {
+		if normalized, ok, nerr := env.NormalizeGitRemoteUrl(urlStr); nerr == nil && ok {
+			urlStr = normalized
+		} else {
+			return HandleVErrAndExitCode(errhand.BuildDError("Invalid remote url").AddCause(err).Build(), usage)
+		}
+	}
+
+	dir := apr.GetValueOrDefault(dirParamName, path.Base(urlStr))
+
+	if dir == "" {
+		return HandleVErrAndExitCode(errhand.BuildDError(`parameter %s has an invalid value of ""`, dirParamName).Build(), usage)
+	}
+
+	scheme, remoteUrl, err := env.GetAbsRemoteUrl(dEnv.FS, dEnv.Config, urlStr)
+
+	if err != nil {
+		return HandleVErrAndExitCode(errhand.BuildDError("Invalid remote url").AddCause(err).Build(), usage)
+	}
+
+	remoteUrlParams, verr := parseRemoteArgs(apr, scheme, remoteUrl)
+
+	if verr != nil {
+		return HandleVErrAndExitCode(verr, usage)
+	}
+
+	srcDB, srcRoot, verr := getRemoteDBAtCommit(ctx, remoteUrl, remoteUrlParams, commitStr, dEnv)
+	if verr != nil {
+		return HandleVErrAndExitCode(verr, usage)
+	}
+	// The remote was opened for this command alone, so close it once we are done reading tables.
+	defer srcDB.Close()
+
+	branches, err := srcDB.GetBranches(ctx)
+	if verr != nil {
+		BuildVerrAndExit("Failed to get remote branches", err)
+	}
+
+	dirExisted, _ := dEnv.FS.Exists(dir)
+
+	dEnv, verr = initializeShallowCloneRepo(ctx, dEnv, srcDB.Format(), dir, env.GetDefaultBranch(dEnv, branches), dirExisted)
+	if verr != nil {
+		return HandleVErrAndExitCode(verr, usage)
+	}
+
+	// The new database is marked in progress until the very end of this function. Anything that goes wrong
+	// before then leaves a database nothing can open, so remove it rather than leaving it on disk.
+	incompleteEnv := dEnv
+	defer func() {
+		if cerr := actions.AbortIncompleteClone(incompleteEnv, dirExisted); cerr != nil {
+			cli.PrintErrln(cerr.Error())
+		}
+	}()
+
+	destRoot, err := dEnv.WorkingRoot(ctx)
+
+	if err != nil {
+		return BuildVerrAndExit("Failed to read working root", err)
+	}
+
+	if len(tblNames) == 0 {
+		tblNames, err = srcRoot.GetTableNames(ctx, doltdb.DefaultSchemaName, true)
+
+		if err != nil {
+			return BuildVerrAndExit("Unable to read tables.", err)
+		}
+	}
+
+	for _, tblName := range tblNames {
+		destRoot, verr = pullTableValue(ctx, dEnv, srcDB, srcRoot, destRoot, downloadLanguage, doltdb.TableName{Name: tblName}, commitStr)
+
+		if verr != nil {
+			return HandleVErrAndExitCode(verr, usage)
+		}
+	}
+
+	err = dEnv.UpdateWorkingRoot(ctx, destRoot)
+
+	if err != nil {
+		return BuildVerrAndExit("Unable to update the working root for local database.", err)
+	}
+
+	err = dbfactory.ClearDatabaseInProgress(dEnv.FS)
+	if err != nil {
+		return BuildVerrAndExit("Unable to finish creating the local database.", err)
+	}
+	incompleteEnv = nil
+
+	return 0
+}
+
+func pullTableValue(ctx context.Context, dEnv *env.DoltEnv, srcDB *doltdb.DoltDB, srcRoot, destRoot doltdb.RootValue, language progLanguage, tblName doltdb.TableName, commitStr string) (doltdb.RootValue, errhand.VerboseError) {
+	tbl, ok, err := srcRoot.GetTable(ctx, tblName)
+	if !ok {
+		return nil, errhand.BuildDError("No table named '%s' at '%s'", tblName, commitStr).Build()
+	} else if err != nil {
+		return nil, errhand.BuildDError("Failed reading table '%s' from remote database.", tblName).AddCause(err).Build()
+	}
+
+	tblHash, err := tbl.HashOf()
+	if err != nil {
+		return nil, errhand.BuildDError("Unable to read from remote database.").AddCause(err).Build()
+	}
+
+	tmpDir, err := dEnv.TempTableFilesDir()
+	if err != nil {
+		return nil, errhand.BuildDError("error: ").AddCause(err).Build()
+	}
+
+	var wg sync.WaitGroup
+	statsCh := make(chan pull.Stats, 128)
+	wg.Go(func() {
+		processStats(language, statsCh)
+	})
+	wg.Go(func() {
+		defer close(statsCh)
+		cli.Println("Retrieving", tblName)
+		err = dEnv.DoltDB(ctx).PullChunks(ctx, tmpDir, srcDB, []hash.Hash{tblHash}, statsCh, nil)
+	})
+	wg.Wait()
+	if err != nil {
+		return nil, errhand.BuildDError("Failed reading chunks for remote table '%s' at '%s'", tblName, commitStr).AddCause(err).Build()
+	}
+
+	destRoot, err = destRoot.SetTableHash(ctx, tblName, tblHash)
+	if err != nil {
+		return nil, errhand.BuildDError("Unable to write to local database.").AddCause(err).Build()
+	}
+
+	return destRoot, nil
+}
+
+// getRemoteDBAtCommit opens the remote at |remoteUrl| and resolves |commitStr| in it. The caller owns the
+// returned DoltDB and must close it.
+func getRemoteDBAtCommit(ctx context.Context, remoteUrl string, remoteUrlParams map[string]string, commitStr string, dEnv *env.DoltEnv) (_ *doltdb.DoltDB, _ doltdb.RootValue, verr errhand.VerboseError) {
+	cacheRoot, _ := dEnv.GitCacheRoot()
+	var srcDB *doltdb.DoltDB
+	_, srcDB, verr = createRemote(ctx, "temp", remoteUrl, remoteUrlParams, dEnv, cacheRoot)
+
+	if verr != nil {
+		return nil, nil, verr
+	}
+
+	// Only a successful return hands the database off to the caller; on failure it is ours to close.
+	defer func() {
+		if verr != nil {
+			srcDB.Close()
+		}
+	}()
+
+	cs, err := doltdb.NewCommitSpec(commitStr)
+
+	if err != nil {
+		return nil, nil, errhand.BuildDError("Invalid Commit '%s'", commitStr).Build()
+	}
+
+	optCmt, err := srcDB.Resolve(ctx, cs, nil)
+	if err != nil {
+		return nil, nil, errhand.BuildDError("Failed to find commit '%s'", commitStr).Build()
+	}
+	cm, ok := optCmt.ToCommit()
+	if !ok {
+		return nil, nil, errhand.BuildDError("%s", doltdb.ErrGhostCommitEncountered.Error()).Build()
+	}
+
+	srcRoot, err := cm.GetRootValue(ctx)
+	if err != nil {
+		return nil, nil, errhand.BuildDError("Failed to read from database").AddCause(err).Build()
+	}
+
+	return srcDB, srcRoot, nil
+}
+
+func initializeShallowCloneRepo(ctx context.Context, dEnv *env.DoltEnv, nbf *types.NomsBinFormat, dir, branchName string, dirExisted bool) (_ *env.DoltEnv, verr errhand.VerboseError) {
+	var err error
+	newEnv, err := actions.EnvForClone(ctx, nbf, env.NoRemote, dir, dEnv.FS, dEnv.Version, env.GetCurrentUserHomeDir)
+
+	if err != nil {
+		return nil, errhand.VerboseErrorFromError(err)
+	}
+
+	// EnvForClone marked the directory in progress, so a failure here must take the directory with it.
+	defer func() {
+		if verr != nil {
+			if cerr := actions.AbortIncompleteClone(newEnv, dirExisted); cerr != nil {
+				cli.PrintErrln(cerr.Error())
+			}
+		}
+	}()
+
+	err = actions.InitEmptyClonedRepo(ctx, newEnv)
+	if err != nil {
+		return nil, errhand.BuildDError("Unable to initialize repo.").AddCause(err).Build()
+	}
+
+	err = newEnv.InitializeRepoState(ctx, branchName)
+	if err != nil {
+		return nil, errhand.BuildDError("Unable to initialize repo.").AddCause(err).Build()
+	}
+
+	return newEnv, nil
+}

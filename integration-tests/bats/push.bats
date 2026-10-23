@@ -1,0 +1,391 @@
+#!/usr/bin/env bats
+load $BATS_TEST_DIRNAME/helper/common.bash
+
+setup() {
+    # See pull.bats. Can't use common remote server setup since we have multiple databases.
+    setup_no_dolt_init
+
+    TESTDIRS=$(pwd)/testdirs
+    mkdir -p $TESTDIRS/{rem1,repo1}
+
+    # repo1 -> rem1 -> repo2
+    cd $TESTDIRS/repo1
+    dolt init
+    dolt remote add origin file://../rem1
+    dolt remote add test-remote file://../rem1
+    dolt push origin main
+
+    cd $TESTDIRS
+    dolt clone file://rem1 repo2
+    cd $TESTDIRS/repo2
+    dolt log
+    dolt remote add test-remote file://../rem1
+
+    # table and comits only present on repo1, rem1 at start
+    cd $TESTDIRS/repo1
+    dolt sql -q "create table t1 (a int primary key, b int)"
+    dolt add .
+    dolt commit -am "First commit"
+    dolt sql -q "insert into t1 values (0,0)"
+    dolt commit -am "Second commit"
+    cd $TESTDIRS
+}
+
+teardown() {
+    teardown_common
+    rm -rf $TESTDIRS
+}
+
+@test "push: push origin" {
+    cd repo1
+    setup_remote_server
+
+    dolt push origin main
+
+    cd ../repo2
+    dolt pull origin
+    run dolt sql -q "show tables" -r csv
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 2 ]
+    [[ "$output" =~ "Table" ]] || false
+    [[ "$output" =~ "t1" ]] || false
+}
+
+@test "push: reject invalid destination branch names" {
+    cd repo1
+    for branch in /bad ////origin/bad bad..name bad.lock bad/; do
+        run dolt push origin "main:$branch"
+        [ "$status" -ne 0 ]
+        [[ "$output" =~ "not a valid user branch name" ]] || false
+    done
+
+    dolt push origin main:valid/nested
+    dolt push origin main:refs/heads/qualified
+    cd ../repo2
+    dolt fetch origin
+    run dolt branch -r
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "origin/valid/nested" ]] || false
+    [[ "$output" =~ "origin/qualified" ]] || false
+    [[ ! "$output" =~ "bad" ]] || false
+}
+
+@test "push: push custom remote" {
+    cd repo1
+    setup_remote_server
+    dolt push test-remote main
+
+    cd ../repo2
+    dolt pull origin
+    run dolt sql -q "show tables" -r csv
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 2 ]
+    [[ "$output" =~ "Table" ]] || false
+    [[ "$output" =~ "t1" ]] || false
+}
+
+@test "push: push without repository defined throws error" {
+    cd repo1
+    setup_remote_server
+
+    run dolt push main    # should push to origin
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "fatal: remote 'main' not found." ]] || false
+
+    run dolt push origin  # should not push to current branch since its upstream is not set
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "fatal: The current branch main has no upstream branch." ]] || false
+
+    dolt push origin main
+
+    cd ../repo2
+    dolt pull origin
+    run dolt sql -q "show tables" -r csv
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 2 ]
+    [[ "$output" =~ "Table" ]] || false
+    [[ "$output" =~ "t1" ]] || false
+}
+
+@test "push: push active branch" {
+    skip "upstream state lost between sessions"
+    cd repo1
+    dolt push origin
+
+    cd ../repo2
+    dolt pull origin
+    run dolt sql -q "show tables" -r csv
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 2 ]
+    [[ "$output" =~ "Table" ]] || false
+    [[ "$output" =~ "t1" ]] || false
+}
+
+@test "push: push feature branch" {
+    cd repo1
+    dolt checkout -b feature
+
+    setup_remote_server
+    dolt push origin feature
+
+    cd ../repo2
+    dolt fetch origin feature
+    dolt checkout feature
+    run dolt sql -q "show tables" -r csv
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 2 ]
+    [[ "$output" =~ "Table" ]] || false
+    [[ "$output" =~ "t1" ]] || false
+}
+
+@test "push: can set upstream branch with different name" {
+    cd repo1
+    dolt checkout -b other
+
+    setup_remote_server
+    dolt push -u origin other:remote-other
+
+    run dolt branch -r
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "remote-other" ]] || false
+}
+
+@test "push: push aborts if nothing specified, upstream has different name" {
+    cd repo1
+    dolt checkout -b other
+
+    setup_remote_server
+    dolt push -u origin other:remote-other
+
+    run dolt push
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "the upstream branch of your current branch does not match the name of your current branch" ]] || false
+}
+
+@test "push: push --set-upstream persists" {
+    cd repo1
+    dolt checkout -b other
+
+    setup_remote_server
+    run dolt push
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "The current branch other has no upstream branch." ]] || false
+
+    dolt push -u origin other
+    # upstream should be set still
+    run dolt push
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Everything up-to-date" ]] || false
+    [[ ! "$output" =~ "The current branch main has no upstream branch." ]] || false
+}
+
+@test "push: push without --set-upstream persists when push.autoSetupRemote is set to true" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+       skip "local config change required for test"
+    fi
+
+    cd repo1
+    dolt checkout -b other
+
+    run dolt push
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "The current branch other has no upstream branch." ]] || false
+
+    dolt config --local --add push.autoSetUpRemote true
+    dolt push
+    # upstream should be set still
+    run dolt push
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Everything up-to-date" ]] || false
+    [[ ! "$output" =~ "The current branch main has no upstream branch." ]] || false
+}
+
+@test "push: push without --set-upstream persists when push.autoSetupRemote is set to all capital TRUE" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+       skip "local config change required for test"
+    fi
+
+    cd repo1
+    dolt checkout -b other
+    run dolt push
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "The current branch other has no upstream branch." ]] || false
+
+    dolt config --local --add push.autoSetUpRemote TRUE
+    dolt push
+    # upstream should be set still
+    run dolt push
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Everything up-to-date" ]] || false
+    [[ ! "$output" =~ "The current branch main has no upstream branch." ]] || false
+}
+
+@test "push: push --force flag" {
+    cd repo2
+    dolt sql -q "create table t2 (a int)"
+    dolt add .
+    dolt commit -am "commit to override"
+    dolt push origin main
+
+    cd ../repo1
+
+    setup_remote_server
+
+    run dolt push origin main
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "hint: Updates were rejected because the tip of your current branch is behind" ]] || false
+
+    dolt push --force origin main
+}
+
+@test "push: push to unknown remote" {
+    cd repo1
+
+    setup_remote_server
+
+    run dolt push unknown main
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "fatal: remote 'unknown' not found" ]] || false
+}
+
+@test "push: push unknown branch" {
+    cd repo1
+
+    setup_remote_server
+
+    run dolt push origin unknown
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "refspec not found: 'unknown'" ]] || false
+}
+
+@test "push: not specifying a branch throws an error" {
+    cd repo1
+
+    setup_remote_server
+
+    run dolt push -u origin
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "fatal: The current branch main has no upstream branch." ]] || false
+}
+
+@test "push: pushing empty branch does not panic" {
+    cd repo1
+
+    setup_remote_server
+
+    run dolt push origin ''
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "invalid ref spec: ''" ]] || false
+}
+
+@test "push: --silent suppresses progress message" {
+    cd repo1
+
+    setup_remote_server
+
+    run dolt push origin main --silent
+    [ "$status" -eq 0 ]
+    ! [[ "$output" =~ "Uploading..." ]] || false
+}
+
+@test "push: push succeeds when file:// remote has ignored tables in working set" {
+    mkdir "$TESTDIRS"/rem2 "$TESTDIRS"/local
+    cd "$TESTDIRS"/local
+    dolt init
+    dolt remote add origin file://../rem2
+    dolt sql -q "CREATE TABLE t (id INT PRIMARY KEY)"
+    dolt sql -q "INSERT INTO dolt_ignore VALUES ('ignored_table', true)"
+    dolt add .
+    dolt commit -m "Initial commit"
+    dolt push origin main
+
+    cd "$TESTDIRS"
+    dolt clone file://rem2 local2
+    cd local2
+    dolt sql -q "INSERT INTO t VALUES (1)"
+    dolt add .
+    dolt commit -m "Second commit"
+
+    run dolt push origin main
+    [ "$status" -eq 0 ]
+}
+
+assert_push_updated() {
+    [[ "$output" =~ [0-9a-v]{32}\.\.[0-9a-v]{32}[[:space:]]+$1\ -\>[[:space:]]$2 ]] || false
+}
+
+assert_push_forced() {
+    [[ "$output" =~ \+[[:space:]][0-9a-v]{32}\.\.\.[0-9a-v]{32}[[:space:]]+$1\ -\>[[:space:]]$2[[:space:]]+\(forced\ update\) ]] || false
+}
+
+@test "push: push existing branch does not report new branch" {
+    cd repo1
+    setup_remote_server
+
+    run dolt push origin main
+    [ "$status" -eq 0 ]
+    [[ ! "$output" =~ "[new branch]" ]] || false
+    assert_push_updated main main
+}
+
+@test "push: force push to existing diverged branch does not report new branch" {
+    (
+        cd repo1
+        dolt push origin main
+    )
+
+    cd repo2
+    dolt sql -q "create table diverged (pk int primary key)"
+    dolt add .
+    dolt commit -m "diverged commit"
+
+    setup_remote_server
+    run dolt push --force origin main
+    [ "$status" -eq 0 ]
+    [[ ! "$output" =~ "[new branch]" ]] || false
+    assert_push_forced main main
+}
+
+@test "push: multi-branch push reports new branch only for new branches" {
+    cd repo1
+    setup_remote_server
+    dolt branch branch_new
+    run dolt push origin branch_new:branch_new main:main
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "* [new branch]          branch_new -> branch_new" ]] || false
+    [[ ! "$output" =~ "* [new branch]          main -> main" ]] || false
+}
+
+@test "push: push tag reports new tag" {
+    cd repo1
+    setup_remote_server
+    dolt tag v1
+    run dolt push origin v1
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "* [new tag]             v1 -> v1" ]] || false
+}
+
+@test "push: delete remote branch reports deleted" {
+    cd repo1
+    setup_remote_server
+    dolt branch to_delete
+    dolt push origin to_delete
+    run dolt push origin :to_delete
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "- [deleted]             to_delete" ]] || false
+}
+
+@test "push: push refspec with different destination name reports src to dest" {
+    cd repo1
+    setup_remote_server
+
+    run dolt push origin main:foobar
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "* [new branch]          main -> foobar" ]] || false
+
+    dolt sql -q "insert into t1 values (10, 10)"
+    dolt commit -am "Commit for foobar"
+    run dolt push origin main:foobar
+    [ "$status" -eq 0 ]
+    assert_push_updated main foobar
+}

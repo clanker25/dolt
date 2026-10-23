@@ -1,0 +1,7 @@
+# Ignore everything...
+**
+
+# Except for the following
+!mysqld.cnf
+!go
+!sysbench-runner-tests-entrypoint.sh

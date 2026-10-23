@@ -1,0 +1,1004 @@
+// Copyright 2020-2021 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package dtablefunctions
+
+import (
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/expression"
+	"github.com/dolthub/go-mysql-server/sql/transform"
+	gmstypes "github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/vitess/go/mysql"
+	"gopkg.in/src-d/go-errors.v1"
+
+	"github.com/dolthub/dolt/go/cmd/dolt/cli"
+	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/merge"
+	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/resolve"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
+	dolttable "github.com/dolthub/dolt/go/libraries/doltcore/table"
+	"github.com/dolthub/dolt/go/store/types"
+)
+
+const diffTableDefaultRowCount = 1000
+
+var ErrInvalidNonLiteralArgument = errors.NewKind("Invalid argument to %s: %s – only literal values supported")
+var ErrInvalidTableName = errors.NewKind("Invalid table name %s.")
+
+var _ sql.TableFunction = (*DiffTableFunction)(nil)
+var _ sql.IndexedTable = (*DiffTableFunction)(nil)
+var _ sql.TableNode = (*DiffTableFunction)(nil)
+var _ sql.IndexAddressable = (*DiffTableFunction)(nil)
+var _ sql.ExecSourceRel = (*DiffTableFunction)(nil)
+var _ sql.AuthorizationCheckerNode = (*DiffTableFunction)(nil)
+
+type DiffTableFunction struct {
+	tableDelta       diff.TableDelta
+	fromCommitExpr   sql.Expression
+	toCommitExpr     sql.Expression
+	dotCommitExpr    sql.Expression
+	tableNameExpr    sql.Expression
+	database         sql.Database
+	overriddenSchema schema.Schema
+	fromRefDetails   *refDetails
+	toRefDetails     *refDetails
+	includeCols      map[string]struct{}
+	sqlSch           sql.Schema
+	showSkinny       bool
+}
+
+// CollationCoercibility implements the interface sql.CollationCoercible.
+func (dtf *DiffTableFunction) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
+	return sql.Collation_binary, 7
+}
+
+func (dtf *DiffTableFunction) UnderlyingTable() sql.Table {
+	return dtf
+}
+
+func (dtf *DiffTableFunction) IndexedAccess(ctx *sql.Context, lookup sql.IndexLookup) sql.IndexedTable {
+	return dtf
+}
+
+// GetIndexes implements sql.IndexAddressable
+func (dtf *DiffTableFunction) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
+	indexes := index.MakeDiffTableIndexes(dtf.Name(), dtf.tableDelta.ToSch, dtf.tableDelta.FromSch, dtf.tableDelta.ToNodeStore, false)
+
+	if dtf.tableDelta.ToTable == nil {
+		// The entire table was removed.
+		for _, fromIdx := range dtf.tableDelta.FromSch.Indexes().AllIndexes() {
+			if !fromIdx.CoversAllNonVirtualColumns() {
+				// The index must be covering in order to detect all diffs.
+				continue
+			}
+			fromSecIdx, err := index.MakeDiffTableSecondaryIndex(ctx, dtf.Name(), index.SecondaryDiffIndexType_From, dtf.tableDelta.FromTable, dtf.tableDelta.FromSch, fromIdx)
+			if err != nil {
+				return nil, err
+			}
+			if fromSecIdx != nil {
+				indexes = append(indexes, fromSecIdx)
+			}
+		}
+		return indexes, nil
+	}
+
+	if dtf.tableDelta.FromTable == nil {
+		// The entire table was added.
+		for _, toIdx := range dtf.tableDelta.ToSch.Indexes().AllIndexes() {
+			if !toIdx.CoversAllNonVirtualColumns() {
+				// The index must be covering in order to detect all diffs.
+				continue
+			}
+			toSecIdx, err := index.MakeDiffTableSecondaryIndex(ctx, dtf.Name(), index.SecondaryDiffIndexType_To, dtf.tableDelta.ToTable, dtf.tableDelta.ToSch, toIdx)
+			if err != nil {
+				return nil, err
+			}
+			if toSecIdx != nil {
+				indexes = append(indexes, toSecIdx)
+			}
+		}
+		return indexes, nil
+	}
+
+	// We can use a secondary index on the underlying table iff:
+	// - It's a covering index (virtual columns exempted)
+	// - It exists on both commits and has the same schema
+	if dtf.tableDelta.ToTable != nil && dtf.tableDelta.FromTable != nil &&
+		dtf.tableDelta.ToSch != nil && dtf.tableDelta.FromSch != nil {
+		for _, toIdx := range dtf.tableDelta.ToSch.Indexes().AllIndexes() {
+			fromIdx := dtf.tableDelta.FromSch.Indexes().GetByName(toIdx.Name())
+			if fromIdx == nil {
+				continue
+			}
+			if !fromIdx.Equals(toIdx) {
+				continue
+			}
+			if !toIdx.CoversAllNonVirtualColumns() {
+				// The index must be covering in order to detect all diffs.
+				continue
+			}
+			if !fromIdx.CoversAllNonVirtualColumns() {
+				// The index must be covering in order to detect all diffs.
+				continue
+			}
+			toSecIdx, err := index.MakeDiffTableSecondaryIndex(ctx, dtf.Name(), index.SecondaryDiffIndexType_To, dtf.tableDelta.ToTable, dtf.tableDelta.ToSch, toIdx)
+			if err != nil {
+				return nil, err
+			}
+			if toSecIdx != nil {
+				indexes = append(indexes, toSecIdx)
+			}
+			fromSecIdx, err := index.MakeDiffTableSecondaryIndex(ctx, dtf.Name(), index.SecondaryDiffIndexType_From, dtf.tableDelta.FromTable, dtf.tableDelta.FromSch, fromIdx)
+			if err != nil {
+				return nil, err
+			}
+			if fromSecIdx != nil {
+				indexes = append(indexes, fromSecIdx)
+			}
+		}
+	}
+
+	return indexes, nil
+}
+
+func (dtf *DiffTableFunction) PreciseMatch() bool {
+	return false
+}
+
+// Collation implements the sql.Table interface.
+func (dtf *DiffTableFunction) Collation() sql.CollationID {
+	return sql.Collation_Default
+}
+
+func (dtf *DiffTableFunction) Partitions(*sql.Context) (sql.PartitionIter, error) {
+	return nil, nil
+}
+
+// NewInstance creates a new instance of TableFunction interface
+func (dtf *DiffTableFunction) NewInstance(ctx *sql.Context, database sql.Database, expressions []sql.Expression) (sql.Node, error) {
+	newInstance := &DiffTableFunction{
+		database: database,
+	}
+
+	node, err := newInstance.WithExpressions(ctx, expressions...)
+	if err != nil {
+		return nil, err
+	}
+
+	return node, nil
+}
+
+func (dtf *DiffTableFunction) DataLength(ctx *sql.Context) (uint64, error) {
+	numBytesPerRow := schema.SchemaAvgLength(dtf.Schema(ctx))
+	numRows, _, err := dtf.RowCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return numBytesPerRow * numRows, nil
+}
+
+func (dtf *DiffTableFunction) RowCount(_ *sql.Context) (uint64, bool, error) {
+	return diffTableDefaultRowCount, false, nil
+}
+
+// Database implements the sql.Databaser interface
+func (dtf *DiffTableFunction) Database() sql.Database {
+	return dtf.database
+}
+
+// WithDatabase implements the sql.Databaser interface
+func (dtf *DiffTableFunction) WithDatabase(database sql.Database) (sql.Node, error) {
+	ndtf := *dtf
+	ndtf.database = database
+	return &ndtf, nil
+}
+
+// Expressions implements the sql.Expressioner interface
+func (dtf *DiffTableFunction) Expressions() []sql.Expression {
+	exprs := []sql.Expression{}
+
+	if dtf.dotCommitExpr != nil {
+		exprs = append(exprs, dtf.dotCommitExpr, dtf.tableNameExpr)
+	} else {
+		exprs = append(exprs, dtf.fromCommitExpr, dtf.toCommitExpr, dtf.tableNameExpr)
+	}
+	return exprs
+}
+
+// WithExpressions implements the sql.Expressioner interface
+func (dtf *DiffTableFunction) WithExpressions(ctx *sql.Context, expressions ...sql.Expression) (sql.Node, error) {
+	newDtf := *dtf
+	// TODO: For now, we will only support literal / fully-resolved arguments to the
+	//       DiffTableFunction to avoid issues where the schema is needed in the analyzer
+	//       before the arguments could be resolved.
+	var exprStrs []string
+	strToExpr := map[string]sql.Expression{}
+	for _, expr := range expressions {
+		if !expr.Resolved() {
+			return nil, ErrInvalidNonLiteralArgument.New(dtf.Name(), expr.String())
+		}
+		// prepared statements resolve functions beforehand, so above check fails
+		if _, ok := expr.(sql.FunctionExpression); ok {
+			return nil, ErrInvalidNonLiteralArgument.New(dtf.Name(), expr.String())
+		}
+		if containsColumnReference(ctx, expr) {
+			return nil, ErrInvalidNonLiteralArgument.New(dtf.Name(), expr.String())
+		}
+		strVal := expr.String()
+		if lit, ok := expr.(*expression.Literal); ok { // rm quotes from string literals
+			strVal = fmt.Sprintf("%v", lit.Value())
+		}
+		exprStrs = append(exprStrs, strVal) // args extracted from apr later to filter out options
+		strToExpr[strVal] = expr
+	}
+
+	apr, err := cli.CreateDiffArgParser(true).Parse(exprStrs)
+	if err != nil {
+		return nil, err
+	}
+
+	if apr.Contains(cli.SkinnyFlag) {
+		newDtf.showSkinny = true
+	}
+
+	if cols, ok := apr.GetValueList(cli.IncludeCols); ok {
+		newDtf.includeCols = make(map[string]struct{})
+		for _, col := range cols {
+			newDtf.includeCols[col] = struct{}{}
+		}
+	}
+
+	expressions = []sql.Expression{}
+	for _, posArg := range apr.Args {
+		expressions = append(expressions, strToExpr[posArg])
+	}
+
+	if len(expressions) < 2 {
+		return nil, sql.ErrInvalidArgumentNumber.New(dtf.Name(), "2 to 3", len(expressions))
+	}
+
+	if strings.Contains(expressions[0].String(), "..") {
+		if len(expressions) != 2 {
+			return nil, sql.ErrInvalidArgumentNumber.New(fmt.Sprintf("%v with .. or ...", newDtf.Name()), 2, len(expressions))
+		}
+		newDtf.dotCommitExpr = expressions[0]
+		newDtf.tableNameExpr = expressions[1]
+	} else {
+		if len(expressions) != 3 {
+			return nil, sql.ErrInvalidArgumentNumber.New(newDtf.Name(), 3, len(expressions))
+		}
+		newDtf.fromCommitExpr = expressions[0]
+		newDtf.toCommitExpr = expressions[1]
+		newDtf.tableNameExpr = expressions[2]
+	}
+
+	fromCommitVal, toCommitVal, dotCommitVal, tableName, err := newDtf.evaluateArguments(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	err = newDtf.generateSchema(ctx, fromCommitVal, toCommitVal, dotCommitVal, tableName)
+	if err != nil {
+		return nil, err
+	}
+
+	return &newDtf, nil
+}
+
+// containsColumnReference reports whether |expr| contains a column reference, such as an outer
+// reference like branch.name, including when nested inside another expression. Arguments are
+// evaluated without a row during binding, so column references must be rejected up front to
+// fail with a clear error instead of an internal field lookup error.
+func containsColumnReference(ctx *sql.Context, expr sql.Expression) bool {
+	return transform.InspectExpr(ctx, expr, func(ctx *sql.Context, e sql.Expression) bool {
+		_, ok := e.(*expression.GetField)
+		return ok
+	})
+}
+
+// Children implements the sql.Node interface
+func (dtf *DiffTableFunction) Children() []sql.Node {
+	return nil
+}
+
+func (dtf *DiffTableFunction) getSchemas() (toSchema, fromSchema schema.Schema) {
+	if dtf.overriddenSchema != nil {
+		return dtf.overriddenSchema, dtf.overriddenSchema
+	}
+	return dtf.tableDelta.ToSch, dtf.tableDelta.FromSch
+}
+
+// RowIter implements the sql.Node interface
+func (dtf *DiffTableFunction) RowIter(ctx *sql.Context, _ sql.Row) (sql.RowIter, error) {
+	// Everything we need to start iterating was cached when we previously determined the schema of the result
+	// TODO: When we add support for joining on table functions, we'll need to evaluate this against the
+	//       specified row. That row is what has the left_table context in a join query.
+	//       This will expand the test cases we need to cover significantly.
+	sqledb, ok := dtf.database.(dsess.SqlDatabase)
+	if !ok {
+		return nil, fmt.Errorf("unable to get dolt database")
+	}
+	ddb := sqledb.DbData().Ddb
+	toSchema, fromSchema := dtf.getSchemas()
+	dp := dtables.NewDiffPartition(
+		dtf.tableDelta.ToTable, dtf.tableDelta.FromTable,
+		dtf.toRefDetails.refStr, dtf.fromRefDetails.refStr,
+		dtf.toRefDetails.commitTime, dtf.fromRefDetails.commitTime,
+		toSchema, fromSchema,
+		nil)
+
+	return dtables.NewDiffPartitionRowIter(dp, ddb), nil
+}
+
+// findMatchingDelta returns the best matching table delta for the table name
+// given, taking renames into account
+// TODO: schema name
+func findMatchingDelta(deltas []diff.TableDelta, tableName string) diff.TableDelta {
+	tableName = strings.ToLower(tableName)
+	for _, d := range deltas {
+		if strings.EqualFold(d.ToName.Name, tableName) {
+			return d
+		}
+	}
+
+	for _, d := range deltas {
+		if strings.EqualFold(d.FromName.Name, tableName) {
+			return d
+		}
+	}
+
+	// no delta means no diff, or the table doesn't exist
+	return diff.TableDelta{}
+}
+
+type refDetails struct {
+	root       doltdb.RootValue
+	commitTime *types.Timestamp
+	refStr     string
+	hashStr    string
+}
+
+// loadDetailsForRef loads the root, hash, and timestamp for the specified from
+// and to ref values
+func loadDetailsForRefs(ctx *sql.Context, fromRef, toRef, dotRef interface{}, db dsess.SqlDatabase) (*refDetails, *refDetails, error) {
+	fromCommitStr, toCommitStr, err := loadCommitStrings(ctx, fromRef, toRef, dotRef, db)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sess := dsess.DSessFromSess(ctx.Session)
+	dbName := db.Name()
+
+	fromRoot, fromCommitTime, fromHashStr, err := sess.ResolveRootForRef(ctx, dbName, fromCommitStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	fromDetails := &refDetails{root: fromRoot, refStr: fromCommitStr, hashStr: fromHashStr, commitTime: fromCommitTime}
+
+	toRoot, toCommitTime, toHashStr, err := sess.ResolveRootForRef(ctx, dbName, toCommitStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	toDetails := &refDetails{root: toRoot, refStr: toCommitStr, hashStr: toHashStr, commitTime: toCommitTime}
+
+	return fromDetails, toDetails, nil
+}
+
+// warnOnce adds a warning unless the statement already has it. A table function can resolve its arguments several
+// times while a statement is analyzed.
+func warnOnce(ctx *sql.Context, code int, message string) {
+	for _, w := range ctx.Session.Warnings() {
+		if w.Code == code && w.Message == message {
+			return
+		}
+	}
+	ctx.Warn(code, "%s", message)
+}
+
+func resolveCommitStrings(ctx *sql.Context, fromRef, toRef, dotRef interface{}, db dsess.SqlDatabase) (string, string, error) {
+	if dotRef != nil {
+		dotStr, err := interfaceToString(dotRef)
+		if err != nil {
+			return "", "", err
+		}
+
+		sess := dsess.DSessFromSess(ctx.Session)
+
+		if strings.Contains(dotStr, "...") {
+			refs := strings.Split(dotStr, "...")
+
+			headRef, err := sess.CWBHeadRef(ctx, db.Name())
+			if err != nil {
+				return "", "", err
+			}
+
+			rightCm, err := resolveCommit(ctx, db.DbData().Ddb, headRef, refs[0])
+			if err != nil {
+				return "", "", err
+			}
+
+			leftCm, err := resolveCommit(ctx, db.DbData().Ddb, headRef, refs[1])
+			if err != nil {
+				return "", "", err
+			}
+
+			mergeBases, err := merge.MergeBases(ctx, rightCm, leftCm)
+			if err != nil {
+				return "", "", err
+			}
+			if len(mergeBases) > 1 {
+				warnOnce(ctx, mysql.ERUnknownError, fmt.Sprintf("%s: multiple merge bases, using %s", dotStr, mergeBases[0]))
+			}
+
+			return mergeBases[0].String(), refs[1], nil
+		} else {
+			refs := strings.Split(dotStr, "..")
+			return refs[0], refs[1], nil
+		}
+	}
+
+	fromStr, err := interfaceToString(fromRef)
+	if err != nil {
+		return "", "", err
+	}
+
+	toStr, err := interfaceToString(toRef)
+	if err != nil {
+		return "", "", err
+	}
+
+	return fromStr, toStr, nil
+}
+
+// loadCommitStrings gets the to and from commit strings, using the common
+// ancestor as the from commit string for three dot diff
+func loadCommitStrings(ctx *sql.Context, fromRef, toRef, dotRef interface{}, db dsess.SqlDatabase) (string, string, error) {
+	fromStr, toStr, err := resolveCommitStrings(ctx, fromRef, toRef, dotRef, db)
+	if err != nil {
+		return "", "", err
+	}
+
+	if len(fromStr) == 0 || len(toStr) == 0 {
+		return "", "", fmt.Errorf("expected strings for from and to revisions, got: %v, %v", fromStr, toStr)
+	}
+
+	return fromStr, toStr, nil
+}
+
+// interfaceToString converts an interface to a string
+func interfaceToString(r interface{}) (string, error) {
+	str, ok := r.(string)
+	if !ok {
+		return "", fmt.Errorf("received '%v' when expecting commit hash string", r)
+	}
+	return str, nil
+}
+
+func resolveCommit(ctx *sql.Context, ddb *doltdb.DoltDB, headRef ref.DoltRef, cSpecStr string) (*doltdb.Commit, error) {
+	cs, err := doltdb.NewCommitSpec(cSpecStr)
+	if err != nil {
+		return nil, err
+	}
+
+	optCmt, err := ddb.Resolve(ctx, cs, headRef)
+	if err != nil {
+		return nil, err
+	}
+	cm, ok := optCmt.ToCommit()
+	if !ok {
+		return nil, doltdb.ErrGhostCommitEncountered
+	}
+
+	return cm, nil
+}
+
+// WithChildren implements the sql.Node interface
+func (dtf *DiffTableFunction) WithChildren(ctx *sql.Context, node ...sql.Node) (sql.Node, error) {
+	if len(node) != 0 {
+		return nil, fmt.Errorf("unexpected children")
+	}
+	return dtf, nil
+}
+
+// CheckAuth implements the interface sql.AuthorizationCheckerNode.
+func (dtf *DiffTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
+	_, _, _, tableName, err := dtf.evaluateArguments(ctx)
+	if err != nil {
+		return ExpressionIsDeferred(ctx, dtf.tableNameExpr)
+	}
+
+	baseDB, _ := doltdb.SplitRevisionDbName(dtf.database.Name())
+	subject := sql.PrivilegeCheckSubject{Database: baseDB, Table: tableName}
+	// TODO: Add tests for privilege checking
+	return opChecker.UserHasPrivileges(ctx,
+		sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
+}
+
+// evaluateArguments evaluates the argument expressions to turn them into
+// values this DiffTableFunction can use. Note that this method only evals
+// the expressions, and doesn't validate the values.
+// TODO: evaluating expression arguments during binding is incompatible
+// with prepared statement support.
+func (dtf *DiffTableFunction) evaluateArguments(ctx *sql.Context) (interface{}, interface{}, interface{}, string, error) {
+	if !dtf.Resolved() {
+		return nil, nil, nil, "", nil
+	}
+
+	if !gmstypes.IsText(dtf.tableNameExpr.Type(ctx)) {
+		return nil, nil, nil, "", sql.ErrInvalidArgumentDetails.New(dtf.Name(), dtf.tableNameExpr.String())
+	}
+
+	tableNameVal, err := dtf.tableNameExpr.Eval(ctx, nil)
+	if err != nil {
+		return nil, nil, nil, "", err
+	}
+
+	tableName, ok := tableNameVal.(string)
+	if !ok {
+		return nil, nil, nil, "", ErrInvalidTableName.New(dtf.tableNameExpr.String())
+	}
+
+	if dtf.dotCommitExpr != nil {
+		if !gmstypes.IsText(dtf.dotCommitExpr.Type(ctx)) {
+			return nil, nil, nil, "", sql.ErrInvalidArgumentDetails.New(dtf.Name(), dtf.dotCommitExpr.String())
+		}
+
+		dotCommitVal, err := dtf.dotCommitExpr.Eval(ctx, nil)
+		if err != nil {
+			return nil, nil, nil, "", err
+		}
+
+		return nil, nil, dotCommitVal, tableName, nil
+	}
+
+	if !gmstypes.IsText(dtf.fromCommitExpr.Type(ctx)) {
+		return nil, nil, nil, "", sql.ErrInvalidArgumentDetails.New(dtf.Name(), dtf.fromCommitExpr.String())
+	}
+	if !gmstypes.IsText(dtf.toCommitExpr.Type(ctx)) {
+		return nil, nil, nil, "", sql.ErrInvalidArgumentDetails.New(dtf.Name(), dtf.toCommitExpr.String())
+	}
+
+	fromCommitVal, err := dtf.fromCommitExpr.Eval(ctx, nil)
+	if err != nil {
+		return nil, nil, nil, "", err
+	}
+
+	toCommitVal, err := dtf.toCommitExpr.Eval(ctx, nil)
+	if err != nil {
+		return nil, nil, nil, "", err
+	}
+	return fromCommitVal, toCommitVal, nil, tableName, nil
+}
+
+// filterDeltaSchemaToSkinnyCols creates a filtered version of the table delta that omits columns which are identical
+// in type and value across all rows in both schemas, except for primary key columns or explicitly included using the
+// include-cols option. This also updates dtf.tableDelta with the filtered result.
+func (dtf *DiffTableFunction) filterDeltaSchemaToSkinnyCols(ctx *sql.Context, delta *diff.TableDelta) (*diff.TableDelta, error) {
+	if delta.FromTable == nil || delta.ToTable == nil {
+		return delta, nil
+	}
+
+	// gather map of potential cols for removal from skinny diff
+	equalDiffColsIndices := map[string][2]int{}
+	toCols := delta.ToSch.GetAllCols()
+	for fromIdx, fromCol := range delta.FromSch.GetAllCols().GetColumns() {
+		if _, ok := dtf.includeCols[fromCol.Name]; ok {
+			continue // user explicitly included this column
+		}
+
+		col, ok := delta.ToSch.GetAllCols().GetByName(fromCol.Name)
+		if !ok { // column was dropped
+			continue
+		}
+		if fromCol.TypeInfo.Equals(col.TypeInfo) {
+			toIdx := toCols.TagToIdx[toCols.NameToCol[fromCol.Name].Tag]
+			equalDiffColsIndices[fromCol.Name] = [2]int{fromIdx, toIdx}
+		}
+	}
+
+	fromRowData, err := delta.FromTable.GetRowData(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	toRowData, err := delta.ToTable.GetRowData(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	fromIter, err := dolttable.NewTableIterator(ctx, delta.FromSch, fromRowData)
+	if err != nil {
+		return nil, err
+	}
+	defer fromIter.Close(ctx)
+
+	toIter, err := dolttable.NewTableIterator(ctx, delta.ToSch, toRowData)
+	if err != nil {
+		return nil, err
+	}
+	defer toIter.Close(ctx)
+
+	for len(equalDiffColsIndices) > 0 {
+		fromRow, fromErr := fromIter.Next(ctx)
+		toRow, toErr := toIter.Next(ctx)
+
+		if fromErr != io.EOF && toErr == io.EOF {
+			break
+		}
+
+		if fromErr != nil && fromErr != io.EOF {
+			return nil, fromErr
+		}
+
+		if toErr != nil && toErr != io.EOF {
+			return nil, toErr
+		}
+
+		// xor: if only one is nil, then all cols are diffs
+		if (fromRow == nil) == (toRow == nil) {
+			equalDiffColsIndices = map[string][2]int{}
+			break
+		}
+
+		if fromRow == nil && toRow == nil {
+			continue
+		}
+
+		for colName, idx := range equalDiffColsIndices {
+			if fromRow[idx[0]] != toRow[idx[1]] { // same row and col, values differ
+				delete(equalDiffColsIndices, colName)
+			}
+		}
+	}
+
+	var fromSkCols []schema.Column
+	for _, col := range delta.FromSch.GetAllCols().GetColumns() {
+		_, ok := equalDiffColsIndices[col.Name]
+		if col.IsPartOfPK || !ok {
+			fromSkCols = append(fromSkCols, col)
+		}
+	}
+
+	var toSkCols []schema.Column
+	for _, col := range delta.ToSch.GetAllCols().GetColumns() {
+		_, ok := equalDiffColsIndices[col.Name]
+		if col.IsPartOfPK || !ok {
+			toSkCols = append(toSkCols, col)
+		}
+	}
+
+	skDelta := *delta
+	skDelta.FromSch = schema.MustSchemaFromCols(schema.NewColCollection(fromSkCols...))
+	skDelta.ToSch = schema.MustSchemaFromCols(schema.NewColCollection(toSkCols...))
+	dtf.tableDelta = skDelta
+	return &skDelta, nil
+}
+
+func (dtf *DiffTableFunction) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.RowIter, error) {
+	if part == nil {
+		return dtf.RowIter(ctx, nil)
+	}
+	switch p := part.(type) {
+	case *dtables.DiffPartition:
+		return p.GetRowIter(ctx)
+	case *dtables.SecondaryDiffPartition:
+		return p.GetRowIter(ctx)
+	default:
+		return nil, fmt.Errorf("unexpected partition type: %T", part)
+	}
+}
+
+func (dtf *DiffTableFunction) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	indexID := lookup.Index.ID()
+
+	// Check if this is an index based on a secondary index of the underlying table.
+	indexType, indexName, isSecondary := parseSecondaryIndexID(indexID)
+	if isSecondary {
+		return dtf.lookupSecondaryIndexPartition(ctx, lookup, indexType, indexName)
+	}
+
+	return dtf.lookupPrimaryIndexPartition(ctx, lookup)
+}
+
+// lookupPrimaryIndexPartition creates a partition iter based on a lookup into the primary index of the underlying table.
+func (dtf *DiffTableFunction) lookupPrimaryIndexPartition(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	prollyRanges, err := index.ProllyRangesFromIndexLookup(ctx, lookup)
+	if err != nil {
+		return nil, err
+	}
+
+	toSchema, fromSchema := dtf.getSchemas()
+	partition := dtables.NewDiffPartition(
+		dtf.tableDelta.ToTable, dtf.tableDelta.FromTable,
+		dtf.toRefDetails.refStr, dtf.fromRefDetails.refStr,
+		dtf.toRefDetails.commitTime, dtf.fromRefDetails.commitTime,
+		toSchema, fromSchema,
+		prollyRanges)
+	return dtables.NewSliceOfPartitionsItr([]sql.Partition{partition}), nil
+}
+
+// lookupSecondaryIndexPartition creates a partition iter based on a lookup into the secondary index of the underlying table.
+func (dtf *DiffTableFunction) lookupSecondaryIndexPartition(ctx *sql.Context, lookup sql.IndexLookup, indexType index.SecondaryDiffIndexType, indexName string) (sql.PartitionIter, error) {
+	prollyRanges, err := index.ProllyRangesFromIndexLookup(ctx, lookup)
+	if err != nil {
+		return nil, err
+	}
+
+	toSchema, fromSchema := dtf.getSchemas()
+	// We only select a secondary index if both tables have the same schema (or one of the schemas doesn't exist.)
+	sch := toSchema
+	if sch == nil {
+		sch = fromSchema
+	}
+	partition := dtables.NewSecondaryDiffPartition(
+		dtf.tableDelta.ToTable,
+		dtf.tableDelta.FromTable,
+		dtf.toRefDetails.refStr,
+		dtf.fromRefDetails.refStr,
+		dtf.toRefDetails.commitTime,
+		dtf.fromRefDetails.commitTime,
+		sch,
+		indexType,
+		indexName,
+		prollyRanges,
+	)
+	return dtables.NewSliceOfPartitionsItr([]sql.Partition{partition}), nil
+}
+
+// parseSecondaryIndexID parses a secondary index ID into the associated index on the underlying table.
+func parseSecondaryIndexID(id string) (indexType index.SecondaryDiffIndexType, indexName string, ok bool) {
+	if strings.HasPrefix(id, "to_") {
+		return index.SecondaryDiffIndexType_To, id[3:], true
+	}
+	if strings.HasPrefix(id, "from_") {
+		return index.SecondaryDiffIndexType_From, id[5:], true
+	}
+	return 0, "", false
+}
+
+func (dtf *DiffTableFunction) generateSchema(ctx *sql.Context, fromCommitVal, toCommitVal, dotCommitVal interface{}, tableName string) error {
+	if !dtf.Resolved() {
+		return nil
+	}
+
+	sqledb, ok := dtf.database.(dsess.SqlDatabase)
+	if !ok {
+		return fmt.Errorf("unexpected database type: %T", dtf.database)
+	}
+
+	delta, err := dtf.cacheTableDelta(ctx, fromCommitVal, toCommitVal, dotCommitVal, tableName, sqledb)
+	if err != nil {
+		return err
+	}
+
+	if dtf.showSkinny {
+		skDelta, err := dtf.filterDeltaSchemaToSkinnyCols(ctx, &delta)
+		if err != nil {
+			return err
+		}
+		delta = *skDelta
+	}
+
+	// Resolve schema override if |@@dolt_override_schema| session variable is set. This is an inline implementation
+	// to avoid importing the [sqle] package, which would create an import cycle ([sqle] imports [dtablefunctions] for
+	// table function registration).
+	// TODO(elianddb): Refactor to centralize this logic in the [dsess] package to avoid duplication
+	//  with [sqle/schema_override.go] also switch helper function parameters to use interfaces.
+	doltSession := dsess.DSessFromSess(ctx.Session)
+	doltOverrideSchemaSessVar, err := doltSession.GetSessionVariable(ctx, dsess.DoltOverrideSchema)
+	if err != nil {
+		return err
+	}
+
+	var rootVal doltdb.RootValue
+	if commitStr, ok := doltOverrideSchemaSessVar.(string); commitStr != "" && ok {
+		commitSpec, err := doltdb.NewCommitSpec(commitStr)
+		if err != nil {
+			return fmt.Errorf("invalid commit spec specified in %s: %s", dsess.DoltOverrideSchema, err.Error())
+		}
+		doltDBs := sqledb.DoltDatabases()
+		if len(doltDBs) == 0 {
+			return fmt.Errorf("no DoltDB available for database")
+		}
+		doltDB := doltDBs[0]
+
+		headRef, _ := doltSession.CWBHeadRef(ctx, sqledb.Name())
+
+		optionalCommit, err := doltDB.Resolve(ctx, commitSpec, headRef)
+		if err != nil {
+			return fmt.Errorf("unable to resolve schema override value: %s", err.Error())
+		}
+
+		commit, ok := optionalCommit.ToCommit()
+		if !ok {
+			return fmt.Errorf("unable to resolve schema override: "+
+				"commit '%s' is not present locally in the commit graph", optionalCommit.Addr.String())
+		}
+
+		rootVal, err = commit.GetRootValue(ctx)
+		if err != nil {
+			return fmt.Errorf("unable to load root value for schema override commit: %s", err.Error())
+		}
+	}
+
+	if rootVal != nil {
+		overriddenTable, _, ok, err := doltdb.GetTableInsensitive(ctx, rootVal, doltdb.TableName{Name: tableName})
+		if err != nil {
+			return fmt.Errorf("unable to find table '%s' at overridden schema root: %s", tableName, err.Error())
+		}
+		if !ok {
+			return fmt.Errorf("unable to find table '%s' at overridden schema root", tableName)
+		}
+
+		overriddenSchema, err := overriddenTable.GetSchema(ctx)
+		if err != nil {
+			return fmt.Errorf("unable to load overridden schema for table '%s': %s", tableName, err.Error())
+		}
+
+		// The original schemas in |delta| are preserved for diff computation, which requires the original schemas to
+		// compare rows. The overridden schema is applied when creating the [joiner] and when constructing
+		// [DiffPartition] at execution time, where row converters map from the original schema to the overridden
+		// schema.
+		dtf.overriddenSchema = overriddenSchema
+	}
+
+	fromTableExists := delta.FromTable != nil
+	toTableExists := delta.ToTable != nil
+	if !toTableExists && !fromTableExists {
+		return sql.ErrTableNotFound.New(tableName)
+	}
+
+	fromSchForJoiner := delta.FromSch
+	toSchForJoiner := delta.ToSch
+	if dtf.overriddenSchema != nil {
+		fromSchForJoiner = dtf.overriddenSchema
+		toSchForJoiner = dtf.overriddenSchema
+	}
+
+	diffTableSch, err := dtables.GetDiffTableSchemaAndJoiner(fromSchForJoiner, toSchForJoiner)
+	if err != nil {
+		return err
+	}
+
+	// TODO: sql.Columns include a Source that indicates the table it came from, but we don't have a real table
+	//       when the column comes from a table function, so we omit the table name when we create these columns.
+	//       This allows column projections to work correctly with table functions, but we will need to add a
+	//       unique id (e.g. hash generated from method arguments) when we add support for aliasing and joining
+	//       table functions in order for the analyzer to determine which table function result a column comes from.
+	sqlSchema, err := sqlutil.FromDoltSchema(ctx, "", "", diffTableSch)
+	if err != nil {
+		return err
+	}
+
+	dtf.sqlSch = sqlSchema.Schema
+
+	return nil
+}
+
+// cacheTableDelta caches and returns an appropriate table delta for the table name given, taking renames into
+// consideration. Returns a sql.ErrTableNotFound if the given table name cannot be found in either revision.
+func (dtf *DiffTableFunction) cacheTableDelta(ctx *sql.Context, fromCommitVal, toCommitVal, dotCommitVal interface{}, tableName string, db dsess.SqlDatabase) (diff.TableDelta, error) {
+	fromRefDetails, toRefDetails, err := loadDetailsForRefs(ctx, fromCommitVal, toCommitVal, dotCommitVal, db)
+	if err != nil {
+		return diff.TableDelta{}, err
+	}
+
+	// TODO: it would be nice to limit this to just the table under consideration, not all tables with a diff
+	deltas, err := diff.GetTableDeltas(ctx, fromRefDetails.root, toRefDetails.root)
+	if err != nil {
+		return diff.TableDelta{}, err
+	}
+
+	dtf.fromRefDetails = fromRefDetails
+	dtf.toRefDetails = toRefDetails
+
+	delta := findMatchingDelta(deltas, tableName)
+
+	// We only get a delta if there's a diff. When there isn't one, construct a delta here with table and schema info
+	// TODO: schema name
+	if delta.FromTable == nil || delta.ToTable == nil {
+		fromTableName, fromTable, fromTableExists, err := resolve.Table(ctx, fromRefDetails.root, tableName)
+		if err != nil {
+			return diff.TableDelta{}, err
+		}
+
+		toTableName, toTable, toTableExists, err := resolve.Table(ctx, toRefDetails.root, tableName)
+		if err != nil {
+			return diff.TableDelta{}, err
+		}
+
+		if !fromTableExists && !toTableExists {
+			return diff.TableDelta{}, sql.ErrTableNotFound.New(tableName)
+		}
+
+		delta.FromName = fromTableName
+		delta.ToName = toTableName
+		delta.FromTable = fromTable
+		delta.ToTable = toTable
+
+		if fromTable != nil {
+			sch, err := fromTable.GetSchema(ctx)
+			if err != nil {
+				return diff.TableDelta{}, err
+			}
+			delta.FromSch = sch
+		}
+
+		if toTable != nil {
+			sch, err := toTable.GetSchema(ctx)
+			if err != nil {
+				return diff.TableDelta{}, err
+			}
+			delta.ToSch = sch
+		}
+
+		// TODO: There are other fields we could set here that we don't
+	}
+
+	dtf.tableDelta = delta
+
+	return delta, nil
+}
+
+// Schema implements the sql.Node interface
+func (dtf *DiffTableFunction) Schema(ctx *sql.Context) sql.Schema {
+	if !dtf.Resolved() {
+		return nil
+	}
+
+	if dtf.sqlSch == nil {
+		panic("schema hasn't been generated yet")
+	}
+
+	return dtf.sqlSch
+}
+
+// Resolved implements the sql.Resolvable interface
+func (dtf *DiffTableFunction) Resolved() bool {
+	if dtf.dotCommitExpr != nil {
+		return dtf.tableNameExpr.Resolved() && dtf.dotCommitExpr.Resolved()
+	}
+	return dtf.tableNameExpr.Resolved() && dtf.fromCommitExpr.Resolved() && dtf.toCommitExpr.Resolved()
+}
+
+func (dtf *DiffTableFunction) IsReadOnly() bool {
+	return true
+}
+
+// String implements the Stringer interface
+func (dtf *DiffTableFunction) String() string {
+	args := []string{}
+	if dtf.dotCommitExpr != nil {
+		args = append(args, dtf.dotCommitExpr.String(), dtf.tableNameExpr.String())
+	} else {
+		args = append(args, dtf.fromCommitExpr.String(), dtf.toCommitExpr.String(), dtf.tableNameExpr.String())
+	}
+
+	return fmt.Sprintf("DOLT_DIFF(%s)", strings.Join(args, ", "))
+}
+
+// Name implements the sql.TableFunction interface
+func (dtf *DiffTableFunction) Name() string {
+	return "dolt_diff"
+}

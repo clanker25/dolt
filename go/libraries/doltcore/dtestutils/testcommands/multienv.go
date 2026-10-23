@@ -1,0 +1,429 @@
+// Copyright 2020 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package testcommands
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/dolthub/go-mysql-server/sql"
+
+	"github.com/dolthub/dolt/go/cmd/dolt/cli"
+	cmd "github.com/dolthub/dolt/go/cmd/dolt/commands"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dtestutils"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dprocedures"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
+	"github.com/dolthub/dolt/go/libraries/utils/filesys"
+	"github.com/dolthub/dolt/go/store/datas"
+	"github.com/dolthub/dolt/go/store/datas/pull"
+	"github.com/dolthub/dolt/go/store/hash"
+	"github.com/dolthub/dolt/go/store/types"
+)
+
+const (
+	homePrefix = "home"
+)
+
+type MultiRepoTestSetup struct {
+	envs    map[string]*env.DoltEnv
+	Remote  string
+	DoltDBs map[string]*doltdb.DoltDB
+	DbNames []string
+	Root    string
+	DbPaths map[string]string
+	Home    string
+	Remotes map[string]env.Remote
+	Errhand func(args ...interface{})
+}
+
+const (
+	name          = "billy bob"
+	email         = "bigbillieb@fake.horse"
+	defaultBranch = "main"
+)
+
+func NewMultiRepoTestSetup(errhand func(args ...interface{})) *MultiRepoTestSetup {
+	dir, err := os.MkdirTemp("", "")
+	if err != nil {
+		errhand(err)
+	}
+
+	homeDir, err := os.MkdirTemp(dir, homePrefix)
+	if err != nil {
+		errhand(err)
+	}
+
+	return &MultiRepoTestSetup{
+		envs:    make(map[string]*env.DoltEnv),
+		Remotes: make(map[string]env.Remote),
+		DoltDBs: make(map[string]*doltdb.DoltDB, 0),
+		DbNames: make([]string, 0),
+		Root:    dir,
+		Home:    homeDir,
+		DbPaths: make(map[string]string, 0),
+		Errhand: errhand,
+	}
+}
+
+func (mr *MultiRepoTestSetup) GetEnv(dbName string) *env.DoltEnv {
+	return mr.envs[dbName]
+}
+
+func (mr *MultiRepoTestSetup) homeProv() (string, error) {
+	return mr.Home, nil
+}
+
+func (mr *MultiRepoTestSetup) Close() {
+	for _, db := range mr.DoltDBs {
+		err := db.Close()
+		if err != nil {
+			mr.Errhand(err)
+		}
+	}
+}
+
+func (mr *MultiRepoTestSetup) Cleanup(dbName string) {
+	os.RemoveAll(mr.Root)
+}
+
+func (mr *MultiRepoTestSetup) NewDB(dbName string) {
+	ctx := context.Background()
+
+	repo := filepath.Join(mr.Root, dbName)
+	os.Mkdir(repo, os.ModePerm)
+
+	err := os.Chdir(repo)
+	if err != nil {
+		mr.Errhand(err)
+	}
+
+	// TODO sometimes tempfiles scrubber is racy with tempfolder deleter
+	dEnv := env.LoadWithoutDB(context.Background(), mr.homeProv, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
+	if err != nil {
+		mr.Errhand("Failed to initialize environment:" + err.Error())
+	}
+	cfg, _ := dEnv.Config.GetConfig(env.GlobalConfig)
+	cfg.SetStrings(map[string]string{
+		config.UserNameKey:  name,
+		config.UserEmailKey: email,
+	})
+	err = dEnv.InitRepo(context.Background(), types.Format_DOLT, name, email, defaultBranch)
+	if err != nil {
+		mr.Errhand("Failed to initialize environment:" + err.Error())
+	}
+
+	ddb, err := doltdb.LoadDoltDB(ctx, types.Format_DOLT, doltdb.LocalDirDoltDB, filesys.LocalFS)
+	if err != nil {
+		mr.Errhand("Failed to initialize environment:" + err.Error())
+	}
+
+	dEnv = env.Load(context.Background(), mr.homeProv, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
+
+	mr.envs[dbName] = dEnv
+	mr.DoltDBs[dbName] = ddb
+	mr.DbNames = append(mr.DbNames, dbName)
+	mr.DbPaths[dbName] = repo
+}
+
+func (mr *MultiRepoTestSetup) NewRemote(remoteName string) {
+	remote := filepath.Join(mr.Root, remoteName)
+	os.Mkdir(remote, os.ModePerm)
+	remotePath := fmt.Sprintf("file:///%s", remote)
+
+	rem := env.NewRemote(remoteName, remotePath, nil)
+
+	for _, dEnv := range mr.envs {
+		dEnv.RepoState.AddRemote(rem)
+		dEnv.RepoState.Save(filesys.LocalFS)
+	}
+
+	mr.Remotes[remoteName] = rem
+}
+
+func (mr *MultiRepoTestSetup) NewBranch(ctx context.Context, dbName, branchName string) {
+	dEnv := mr.envs[dbName]
+	err := actions.CreateBranchWithStartPt(context.Background(), dEnv.DbData(ctx), branchName, "head", false, nil)
+	if err != nil {
+		mr.Errhand(err)
+	}
+}
+
+func (mr *MultiRepoTestSetup) CheckoutBranch(dbName, branchName string) {
+	dEnv := mr.envs[dbName]
+	var err error
+	cliCtx, err := cmd.NewArgFreeCliContext(context.Background(), dEnv, dEnv.FS)
+	if err != nil {
+		mr.Errhand(err)
+	}
+	defer cliCtx.Close()
+	queryist, err := cliCtx.QueryEngine(context.Background())
+	if err != nil {
+		mr.Errhand(err)
+	}
+	err = dprocedures.MoveWorkingSetToBranch(queryist.Context, branchName, false, false, true)
+	if err != nil {
+		mr.Errhand(err)
+	}
+}
+
+func (mr *MultiRepoTestSetup) CloneDB(fromRemote, dbName string) {
+	ctx := context.Background()
+	cloneDir := filepath.Join(mr.Root, dbName)
+
+	r := mr.GetRemote(fromRemote)
+	srcDB, err := r.GetRemoteDB(ctx, types.Format_DOLT, mr.envs[dbName])
+	if err != nil {
+		mr.Errhand(err)
+	}
+
+	dEnv := env.LoadWithoutDB(context.Background(), mr.homeProv, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
+	dEnv, err = actions.EnvForClone(ctx, srcDB.Format(), r, cloneDir, dEnv.FS, dEnv.Version, mr.homeProv)
+	if err != nil {
+		mr.Errhand(err)
+	}
+
+	pull.WithDiscardingStatsCh(func(statsCh chan pull.Stats) {
+		err = actions.CloneRemote(ctx, srcDB, r.Name, "", false, -1, dEnv, statsCh)
+	})
+	if err != nil {
+		mr.Errhand(err)
+	}
+
+	err = dbfactory.ClearDatabaseInProgress(dEnv.FS)
+	if err != nil {
+		mr.Errhand(err)
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		mr.Errhand(err)
+	}
+	err = os.Chdir(cloneDir)
+	if err != nil {
+		mr.Errhand(err)
+	}
+	defer os.Chdir(wd)
+
+	ddb := dEnv.DoltDB(ctx)
+
+	mr.envs[dbName] = dEnv
+	mr.DoltDBs[dbName] = ddb
+	mr.DbNames = append(mr.DbNames, dbName)
+	mr.DbPaths[dbName] = cloneDir
+}
+
+func (mr *MultiRepoTestSetup) GetRemote(remoteName string) env.Remote {
+	rem, ok := mr.Remotes[remoteName]
+	if !ok {
+		mr.Errhand("remote not found")
+	}
+	return rem
+}
+
+func (mr *MultiRepoTestSetup) GetDB(dbName string) *doltdb.DoltDB {
+	db, ok := mr.DoltDBs[dbName]
+	if !ok {
+		mr.Errhand("db not found")
+	}
+	return db
+}
+
+func (mr *MultiRepoTestSetup) CommitWithWorkingSet(dbName string) *doltdb.Commit {
+	ctx := sql.NewContextWithVariables(context.Background(), sqle.NewEngineVariables())
+	dEnv := mr.envs[dbName]
+	ws, err := dEnv.WorkingSet(ctx)
+	if err != nil {
+		panic("couldn't get working set: " + err.Error())
+	}
+
+	prevHash, err := ws.HashOf()
+	if err != nil {
+		panic("couldn't get working set: " + err.Error())
+	}
+
+	var mergeParentCommits []*doltdb.Commit
+	if ws.MergeActive() {
+		mergeParentCommits = []*doltdb.Commit{ws.MergeState().Commit()}
+	}
+
+	roots, err := dEnv.Roots(ctx)
+	if err != nil {
+		panic("couldn't get roots: " + err.Error())
+	}
+	ident := datas.CommitIdent{Name: name, Email: email}
+	commitStagedProps := actions.CommitStagedProps{
+		Message:    "auto commit",
+		AllowEmpty: true,
+		Author:     ident,
+		Committer:  ident,
+	}
+	pendingCommit, err := actions.GetCommitStaged(ctx, doltdb.SimpleTableResolver{}, roots, ws, mergeParentCommits, hash.Hash{}, dEnv.DbData(ctx).Ddb, commitStagedProps)
+	if err != nil {
+		panic("pending commit error: " + err.Error())
+	}
+
+	headRef, err := ws.Ref().ToHeadRef()
+	if err != nil {
+		panic(err)
+	}
+	ddb := dEnv.DoltDB(ctx)
+	heads, err := ddb.CommitHeadUpdates(ctx, []doltdb.HeadUpdate{doltdb.WorkingSetUpdate{
+		WorkingSet: ws.WithStagedRoot(pendingCommit.Roots.Staged).WithWorkingRoot(pendingCommit.Roots.Working).ClearMerge(),
+		PrevHash:   prevHash,
+		Meta:       doltdb.TodoWorkingSetMeta(),
+	}, doltdb.BranchHeadUpdate{
+		HeadRef:       headRef,
+		Root:          pendingCommit.Roots.Staged,
+		CommitOptions: pendingCommit.CommitOptions,
+		WorkingSetRef: ws.Ref(),
+		PrevWsHash:    prevHash,
+	}}, nil)
+	if err != nil {
+		panic("couldn't commit: " + err.Error())
+	}
+	commit, err := doltdb.HashToCommit(ctx, ddb.ValueReadWriter(), ddb.NodeStore(), heads[1])
+	if err != nil {
+		panic("couldn't read commit: " + err.Error())
+	}
+	return commit
+}
+
+func (mr *MultiRepoTestSetup) CreateTable(ctx context.Context, dbName, tblName string) {
+	dEnv := mr.envs[dbName]
+
+	sch, err := dtestutils.Schema()
+	if err != nil {
+		mr.Errhand(err)
+	}
+
+	if err := createTestTable(dEnv, tblName, sch); err != nil {
+		mr.Errhand(err)
+	}
+}
+
+func (mr *MultiRepoTestSetup) StageAll(dbName string) {
+	dEnv := mr.envs[dbName]
+
+	ctx := context.Background()
+	roots, err := dEnv.Roots(ctx)
+	if err != nil {
+		mr.Errhand(fmt.Sprintf("Failed to get roots: %s", dbName))
+	}
+
+	roots, err = actions.StageAllTables(ctx, roots, true)
+	if err != nil {
+		mr.Errhand(fmt.Sprintf("Failed to stage tables: %s", dbName))
+	}
+	err = dEnv.UpdateRoots(ctx, roots)
+	if err != nil {
+		mr.Errhand(fmt.Sprintf("Failed to update roots: %s", dbName))
+	}
+}
+
+func (mr *MultiRepoTestSetup) PushToRemote(dbName, remoteName, branchName string) {
+	ctx := context.Background()
+	dEnv := mr.envs[dbName]
+
+	ap := cli.CreatePushArgParser()
+	apr, err := ap.Parse([]string{remoteName, branchName})
+	if err != nil {
+		mr.Errhand(fmt.Sprintf("Failed to push remote: %s", err.Error()))
+	}
+	targets, remote, err := env.NewPushOpts(ctx, apr, dEnv.RepoStateReader(), dEnv.DoltDB(ctx), false, false, false, false)
+	if err != nil {
+		mr.Errhand(fmt.Sprintf("Failed to push remote: %s", err.Error()))
+	}
+
+	remoteDB, err := remote.GetRemoteDB(ctx, dEnv.DoltDB(ctx).ValueReadWriter().Format(), mr.envs[dbName])
+	if err != nil {
+		mr.Errhand(actions.HandleInitRemoteStorageClientErr(remote.Name, remote.Url, err))
+	}
+
+	tmpDir, err := dEnv.TempTableFilesDir()
+	if err != nil {
+		mr.Errhand(fmt.Sprintf("Failed to access .dolt directory: %s", err.Error()))
+	}
+
+	pushOptions := &env.PushOptions[context.Context]{
+		Targets: targets,
+		Remote:  remote,
+		Rsr:     dEnv.RepoStateReader(),
+		Rsw:     dEnv.RepoStateWriter(),
+		SrcDb:   dEnv.DoltDB(ctx),
+		DestDb:  remoteDB,
+		TmpDir:  tmpDir,
+	}
+	pull.WithDiscardingStatsCh(func(statsCh chan pull.Stats) {
+		_, err = actions.DoPush(ctx, pushOptions, statsCh)
+	})
+	if err != nil {
+		mr.Errhand(fmt.Sprintf("Failed to push remote: %s", err.Error()))
+	}
+}
+
+// createTestTable creates a new test table with the name, schema, and rows given.
+func createTestTable(dEnv *env.DoltEnv, tableName string, sch schema.Schema) error {
+	ctx := context.Background()
+	vrw := dEnv.DoltDB(ctx).ValueReadWriter()
+	ns := dEnv.DoltDB(ctx).NodeStore()
+
+	idx, err := durable.NewEmptyPrimaryIndex(ctx, vrw, ns, sch)
+	if err != nil {
+		return err
+	}
+
+	tbl, err := doltdb.NewTable(ctx, vrw, ns, sch, idx, nil, nil)
+	if err != nil {
+		return err
+	}
+
+	sch, err = tbl.GetSchema(ctx)
+	if err != nil {
+		return err
+	}
+
+	root, err := dEnv.WorkingRoot(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %v", doltdb.ErrNomsIO, err)
+	}
+
+	newRoot, err := root.PutTable(ctx, doltdb.TableName{Name: tableName}, tbl)
+	if err != nil {
+		return err
+	}
+
+	rootHash, err := root.HashOf()
+	if err != nil {
+		return err
+	}
+
+	newRootHash, err := newRoot.HashOf()
+	if err != nil {
+		return err
+	}
+	if rootHash == newRootHash {
+		return nil
+	}
+	return dEnv.UpdateWorkingRoot(ctx, newRoot)
+}

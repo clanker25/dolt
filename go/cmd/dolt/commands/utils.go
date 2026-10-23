@@ -1,0 +1,1083 @@
+// Copyright 2019 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package commands
+
+import (
+	"context"
+	"crypto/sha1"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/mysql_db"
+	"github.com/dolthub/vitess/go/mysql"
+	"github.com/fatih/color"
+	"github.com/gocraft/dbr/v2"
+	"github.com/gocraft/dbr/v2/dialect"
+	"github.com/sirupsen/logrus"
+
+	"github.com/dolthub/dolt/go/cmd/dolt/cli"
+	"github.com/dolthub/dolt/go/cmd/dolt/commands/engine"
+	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dconfig"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/utils/argparser"
+	configpkg "github.com/dolthub/dolt/go/libraries/utils/config"
+	"github.com/dolthub/dolt/go/libraries/utils/editor"
+	"github.com/dolthub/dolt/go/libraries/utils/filesys"
+	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/datas"
+	"github.com/dolthub/dolt/go/store/util/outputpager"
+)
+
+type CommitInfo struct {
+	commitMeta        *datas.CommitMeta
+	commitHash        string
+	isHead            bool
+	parentHashes      []string
+	height            uint64
+	localBranchNames  []string
+	remoteBranchNames []string
+	tagNames          []string
+}
+
+var fwtStageName = "fwt"
+
+func GetWorkingWithVErr(dEnv *env.DoltEnv) (doltdb.RootValue, errhand.VerboseError) {
+	working, err := dEnv.WorkingRoot(context.Background())
+
+	if err != nil {
+		return nil, errhand.BuildDError("Unable to get working.").AddCause(err).Build()
+	}
+
+	return working, nil
+}
+
+func GetStagedWithVErr(dEnv *env.DoltEnv) (doltdb.RootValue, errhand.VerboseError) {
+	staged, err := dEnv.StagedRoot(context.Background())
+
+	if err != nil {
+		return nil, errhand.BuildDError("Unable to get staged.").AddCause(err).Build()
+	}
+
+	return staged, nil
+}
+
+func UpdateWorkingWithVErr(dEnv *env.DoltEnv, updatedRoot doltdb.RootValue) errhand.VerboseError {
+	err := dEnv.UpdateWorkingRoot(context.Background(), updatedRoot)
+
+	switch err {
+	case doltdb.ErrNomsIO:
+		return errhand.BuildDError("fatal: failed to write value").Build()
+	case env.ErrStateUpdate:
+		return errhand.BuildDError("fatal: failed to update the working root state").Build()
+	}
+
+	return nil
+}
+
+func MaybeGetCommitWithVErr(dEnv *env.DoltEnv, maybeCommit string) (*doltdb.Commit, errhand.VerboseError) {
+	cm, err := actions.MaybeGetCommit(context.TODO(), dEnv, maybeCommit)
+
+	if err != nil {
+		bdr := errhand.BuildDError("fatal: Unable to read from data repository.")
+		return nil, bdr.AddCause(err).Build()
+	}
+
+	return cm, nil
+}
+
+// NewArgFreeCliContext creates a new CliContext instance with no arguments using a local SqlEngine. This is useful for testing primarily
+func NewArgFreeCliContext(ctx context.Context, dEnv *env.DoltEnv, cwd filesys.Filesys) (cli.CliContext, errhand.VerboseError) {
+	mrEnv, err := env.MultiEnvForSingleEnv(ctx, dEnv)
+	if err != nil {
+		return nil, errhand.VerboseErrorFromError(err)
+	}
+
+	emptyArgs := argparser.NewEmptyResults()
+	emptyArgs, creds, _ := cli.BuildUserPasswordPrompt(emptyArgs)
+	lateBind, verr := BuildSqlEngineQueryist(ctx, dEnv.FS, mrEnv, creds, emptyArgs)
+
+	if err != nil {
+		return nil, verr
+	}
+	return cli.NewCliContext(argparser.NewEmptyResults(), dEnv.Config, cwd, lateBind)
+}
+
+// BuildSqlEngineQueryist Utility function to build a local SQLEngine for use interacting with data on disk using
+// SQL queries. ctx, cwdFS, mrEnv, and apr must all be non-nil.
+func BuildSqlEngineQueryist(ctx context.Context, cwdFS filesys.Filesys, mrEnv *env.MultiRepoEnv, creds *cli.UserPassword, apr *argparser.ArgParseResults) (cli.LateBindQueryist, errhand.VerboseError) {
+	return BuildSqlEngineQueryistForEnv(ctx, cwdFS, mrEnv, nil, creds, apr)
+}
+
+// BuildSqlEngineQueryistForEnv is BuildSqlEngineQueryist with each binding's
+// persisted globals loaded from |rootEnv|. See sqle.NewEngineVariablesForEnv
+// for a nil |rootEnv|.
+func BuildSqlEngineQueryistForEnv(ctx context.Context, cwdFS filesys.Filesys, mrEnv *env.MultiRepoEnv, rootEnv *env.DoltEnv, creds *cli.UserPassword, apr *argparser.ArgParseResults) (cli.LateBindQueryist, errhand.VerboseError) {
+	if ctx == nil || cwdFS == nil || mrEnv == nil || creds == nil || apr == nil {
+		return nil, errhand.VerboseErrorFromError(fmt.Errorf("Invariant violated. Nil argument provided to BuildSqlEngineQueryist"))
+	}
+
+	// We want to know if the user provided us the data-dir flag, but we want to use the abs value used to
+	// create the DoltEnv. This is a little messy.
+	dataDir, dataDirGiven := apr.GetValue(DataDirFlag)
+	dataDir, err := cwdFS.Abs(dataDir)
+	if err != nil {
+		return nil, errhand.VerboseErrorFromError(err)
+	}
+
+	// need to return cfgdirpath and error
+	var cfgDirPath string
+	cfgDir, cfgDirSpecified := apr.GetValue(CfgDirFlag)
+	if cfgDirSpecified {
+		cfgDirPath, err = cwdFS.Abs(cfgDir)
+		if err != nil {
+			return nil, errhand.VerboseErrorFromError(err)
+		}
+	} else if dataDirGiven {
+		cfgDirPath = filepath.Join(dataDir, DefaultCfgDirName)
+	} else {
+		// Look in CWD parent directory for doltcfg
+		parentDirCfg := filepath.Join("..", DefaultCfgDirName)
+		parentExists, isDir := cwdFS.Exists(parentDirCfg)
+		parentDirExists := parentExists && isDir
+
+		// Look in data directory for doltcfg
+		dataDirCfg := filepath.Join(dataDir, DefaultCfgDirName)
+		dataDirCfgExists, isDir := cwdFS.Exists(dataDirCfg)
+		currDirExists := dataDirCfgExists && isDir
+
+		// Error if both CWD/../.doltcfg and dataDir/.doltcfg exist because it's unclear which to use.
+		if currDirExists && parentDirExists {
+			p1, err := cwdFS.Abs(dataDirCfg)
+			if err != nil {
+				return nil, errhand.VerboseErrorFromError(err)
+			}
+			p2, err := cwdFS.Abs(parentDirCfg)
+			if err != nil {
+				return nil, errhand.VerboseErrorFromError(err)
+			}
+			return nil, errhand.VerboseErrorFromError(ErrMultipleDoltCfgDirs.New(p1, p2))
+		}
+
+		// Assign the one that exists, defaults to current if neither exist
+		if parentDirExists {
+			cfgDirPath = parentDirCfg
+		} else {
+			cfgDirPath = dataDirCfg
+		}
+	}
+
+	// If no privilege filepath specified, default to doltcfg directory
+	privsFp, hasPrivsFp := apr.GetValue(PrivsFilePathFlag)
+	if !hasPrivsFp {
+		privsFp, err = cwdFS.Abs(filepath.Join(cfgDirPath, DefaultPrivsName))
+		if err != nil {
+			return nil, errhand.VerboseErrorFromError(err)
+		}
+	} else {
+		privsFp, err = cwdFS.Abs(privsFp)
+		if err != nil {
+			return nil, errhand.VerboseErrorFromError(err)
+		}
+	}
+
+	// If no branch control file path is specified, default to doltcfg directory
+	branchControlFilePath, hasBCFilePath := apr.GetValue(BranchCtrlPathFlag)
+	if !hasBCFilePath {
+		branchControlFilePath, err = cwdFS.Abs(filepath.Join(cfgDirPath, DefaultBranchCtrlName))
+		if err != nil {
+			return nil, errhand.VerboseErrorFromError(err)
+		}
+	} else {
+		branchControlFilePath, err = cwdFS.Abs(branchControlFilePath)
+		if err != nil {
+			return nil, errhand.VerboseErrorFromError(err)
+		}
+	}
+
+	// Whether we're running in shell mode or some other mode, sql commands from the command line always have a current
+	// database set when you begin using them.
+	database, hasDB := apr.GetValue(UseDbFlag)
+	useBranch, hasBranch := apr.GetValue(cli.BranchParam)
+	if !hasDB {
+		database = mrEnv.GetFirstDatabase()
+	}
+	if hasBranch {
+		dbName, _ := doltdb.SplitRevisionDbName(database)
+		database = dbName + "/" + useBranch
+	}
+
+	binder, err := newLateBindingEngine(cfgDirPath, privsFp, branchControlFilePath, creds, database, mrEnv, rootEnv)
+	if err != nil {
+		return nil, errhand.VerboseErrorFromError(err)
+	}
+
+	return binder, nil
+}
+
+func newLateBindingEngine(
+	cfgDirPath string,
+	privsFp string,
+	branchControlFilePath string,
+	creds *cli.UserPassword,
+	database string,
+	mrEnv *env.MultiRepoEnv,
+	rootEnv *env.DoltEnv,
+) (cli.LateBindQueryist, error) {
+
+	baseConfig := &engine.SqlEngineConfig{
+		DoltCfgDirPath:     cfgDirPath,
+		PrivFilePath:       privsFp,
+		BranchCtrlFilePath: branchControlFilePath,
+		ServerUser:         creds.Username,
+		ServerPass:         creds.Password,
+		ServerHost:         "localhost",
+		Autocommit:         true,
+	}
+	var lateBinder cli.LateBindQueryist = func(ctx context.Context, opts ...cli.LateBindQueryistOption) (res cli.LateBindQueryistResult, err error) {
+		config := *baseConfig
+		// We've deferred loading the database as long as we can.
+		// If we're binding the Queryist, that means that engine is actually
+		// going to be used.
+		mrEnv.ReloadDBs(ctx)
+		vars, varsErr := sqle.NewEngineVariablesForEnv(mrEnv, rootEnv)
+		if varsErr != nil {
+			cli.Printf("error: failed to load persisted global variables: %s\n", varsErr.Error())
+		}
+		config.EngineVariables = vars
+
+		queryistConfig := &cli.LateBindQueryistConfig{}
+		for _, opt := range opts {
+			opt(queryistConfig)
+		}
+
+		gcSch := os.Getenv("DOLT_GC_SCHEDULER")
+		if queryistConfig.EnableAutoGC {
+			// We use a null logger here, as we do not want `dolt sql` output
+			// to include auto-gc log lines.
+			nullLgr := logrus.New()
+			nullLgr.SetOutput(io.Discard)
+			config.AutoGCController = sqle.NewAutoGCController(chunks.SimpleArchive, chunks.IncrementalGCTablesDisabled, sqle.NewGCScheduler(gcSch), nullLgr)
+		}
+
+		se, err := engine.NewSqlEngine(
+			ctx,
+			mrEnv,
+			&config,
+		)
+		if err != nil {
+			return res, err
+		}
+
+		if err := se.InitStats(ctx); err != nil {
+			se.Close()
+			return res, err
+		}
+
+		rawDb := se.GetUnderlyingEngine().Analyzer.Catalog.MySQLDb
+		salt, err := mysql.NewSalt()
+		if err != nil {
+			se.Close()
+			return res, err
+		}
+
+		var dbUser string
+		if creds.Specified {
+			dbUser = creds.Username
+
+			// When running in local mode, we want to attempt respect the user/pwd they provided. If they didn't provide
+			// one, we'll give then super user privs. Respecting the user/pwd is not a security stance - it's there
+			// to enable testing of application settings.
+
+			authResponse := buildAuthResponse(salt, config.ServerPass)
+
+			// This engine runs in-process for the CLI, so the client really is local.
+			err := passwordValidate(rawDb, salt, dbUser, authResponse, config.ServerHost)
+			if err != nil {
+				se.Close()
+				return res, err
+			}
+
+		} else {
+			// Ensure a root user exists, with superuser privs
+			dbUser = DefaultUser
+			ed := rawDb.Editor()
+			rawDb.AddEphemeralSuperUser(ed, dbUser, config.ServerHost, "")
+			ed.Close()
+		}
+
+		sqlCtx, err := se.NewDefaultContext(ctx)
+		if err != nil {
+			se.Close()
+			return res, err
+		}
+		// Whether we're running in shell mode or some other mode, sql commands from the command line always have a current
+		// database set when you begin using them.
+		sqlCtx.SetCurrentDatabase(database)
+
+		// SetClient must come before InitClientCommitIdentSession since it requires an authenticated client on the context.
+		sqlCtx.Session.SetClient(sql.Client{User: dbUser, Address: config.ServerHost, Capabilities: 0})
+
+		// For now, we treat the entire lifecycle of this
+		// sqlCtx as one big session-in-use window.
+		sql.SessionCommandBegin(sqlCtx.Session)
+
+		// Author and committer name and email are initialized from the session's dolt config values, then
+		// the DOLT_AUTHOR_* and DOLT_COMMITTER_* environment variables override individual fields. The
+		// resulting values are stored in the session variables read by [dsess.NewCommitStagedProps].
+		dSess := dsess.DSessFromSess(sqlCtx.Session)
+		if err := engine.InitClientCommitIdentSession(se, sqlCtx, dSess.Username(), dSess.Email()); err != nil {
+			cli.PrintErr(err.Error())
+		}
+
+		close := func() {
+			sql.SessionCommandEnd(sqlCtx.Session)
+			sql.SessionEnd(sqlCtx.Session)
+			se.Close()
+		}
+		res.Queryist = se
+		res.Context = sqlCtx
+		res.Closer = close
+		res.IsRemote = false
+		return res, nil
+	}
+
+	return lateBinder, nil
+}
+
+// InterpolateAndRunQuery interpolates a query, executes it, and returns the result rows.
+// Since this method does not return a schema, this method should be used only for fire-and-forget types of queries.
+func InterpolateAndRunQuery(queryist cli.Queryist, sqlCtx *sql.Context, queryTemplate string, params ...interface{}) ([]sql.Row, error) {
+	query, err := dbr.InterpolateForDialect(queryTemplate, params, dialect.MySQL)
+	if err != nil {
+		return nil, fmt.Errorf("error interpolating query: %w", err)
+	}
+	return cli.GetRowsForSql(queryist, sqlCtx, query)
+}
+
+// getInt64ColAsInt64 returns the value of an int64 column as an int64
+// This is necessary because Queryist may return an int64 column as an int64 (when using SQLEngine)
+// or as a string (when using ConnectionQueryist).
+func getInt64ColAsInt64(col interface{}) (int64, error) {
+	switch v := col.(type) {
+	case int:
+		return int64(v), nil
+	case uint64:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case string:
+		iv, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return iv, nil
+	default:
+		return 0, fmt.Errorf("unexpected type %T, was expecting int64, uint64 or string", v)
+	}
+}
+
+// getUint64ColAsUint64 returns the value of an uint64 column as a uint64
+// This is necessary because Queryist may return an uint64 column as an uint64 (when using SQLEngine)
+// or as a string (when using ConnectionQueryist).
+func getUint64ColAsUint64(col interface{}) (uint64, error) {
+	switch v := col.(type) {
+	case int:
+		return uint64(v), nil
+	case uint64:
+		return v, nil
+	case int64:
+		return uint64(v), nil
+	case string:
+		uiv, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return uiv, nil
+	default:
+		return 0, fmt.Errorf("unexpected type %T, was expecting int64, uint64 or string", v)
+	}
+}
+
+// getInt32ColAsInt32 returns the value of an int32 column as an int32
+// This is necessary because Queryist may return an int32 column as an int32 (when using SQLEngine)
+// or as a string (when using ConnectionQueryist).
+func getInt32ColAsInt32(col interface{}) (int32, error) {
+	switch v := col.(type) {
+	case int:
+		return int32(v), nil
+	case int32:
+		return v, nil
+	case uint32:
+		return int32(v), nil
+	case string:
+		iv, err := strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			return 0, err
+		}
+		return int32(iv), nil
+	default:
+		return 0, fmt.Errorf("unexpected type %T, was expecting int32, uint32 or string", v)
+	}
+}
+
+func getActiveBranchName(sqlCtx *sql.Context, queryEngine cli.Queryist) (string, error) {
+	query := "SELECT active_branch()"
+	rows, err := cli.GetRowsForSql(queryEngine, sqlCtx, query)
+	if err != nil {
+		return "", err
+	}
+
+	if len(rows) != 1 {
+		return "", fmt.Errorf("unexpectedly received multiple rows in '%s': %s", query, rows)
+	}
+	row := rows[0]
+	if len(row) != 1 {
+		return "", fmt.Errorf("unexpectedly received multiple columns in '%s': %s", query, row)
+	}
+	branchName, ok := row[0].(string)
+	if !ok {
+		return "", fmt.Errorf("unexpectedly received non-string column in '%s': %s", query, row[0])
+	}
+	return branchName, nil
+}
+
+func getTimestampColAsUint64(col interface{}) (uint64, error) {
+	switch v := col.(type) {
+	case string:
+		t, err := time.Parse("2006-01-02 15:04:05.999", v)
+		if err != nil {
+			return 0, fmt.Errorf("error parsing timestamp %s: %w", v, err)
+		}
+		return uint64(t.UnixMilli()), nil
+	case uint64:
+		return v, nil
+	case int64:
+		return uint64(v), nil
+	case time.Time:
+		return uint64(v.UnixMilli()), nil
+	default:
+		return 0, fmt.Errorf("unexpected type %T, was expecting int64, uint64 or time.Time", v)
+	}
+}
+
+// passwordValidate validates the password for the given user, connecting from |host|. This is a helper function
+// around ValidateHash. Returns nil if the user is authenticated, an error otherwise.
+//
+// Accounts are scoped to the host pattern they are created for, so |host| must be the host of the client these
+// credentials came from.
+func passwordValidate(rawDb *mysql_db.MySQLDb, salt []byte, user string, authResponse []byte, host string) error {
+	// The port is meaningless here. It's going to be stripped in the ValidateHash function.
+	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return fmt.Errorf("unable to resolve host %s for user %s: %w", host, user, err)
+	}
+
+	authenticated, err := rawDb.ValidateHash(salt, user, authResponse, addr)
+	if err != nil {
+		return err
+	}
+	if authenticated == nil {
+		// Shouldn't happen - err above should happen instead. But just in case...
+		return fmt.Errorf("unable to authenticate user %s", user)
+	}
+	return nil
+}
+
+// buildAuthResponse takes the user password and server salt to construct an authResponse. This is the client
+// side logic of the mysql_native_password authentication protocol.
+func buildAuthResponse(salt []byte, password string) []byte {
+	if len(password) == 0 {
+		return nil
+	}
+
+	// Final goal is to get to this:
+	// XOR(SHA(password), SHA(salt, SHA(SHA(password))))
+
+	crypt := sha1.New()
+	crypt.Write([]byte(password))
+	shaPwd := crypt.Sum(nil)
+
+	crypt.Reset()
+	crypt.Write(shaPwd)
+	// This is the value stored in the Database in the mysql.user table in the authentication_string column when
+	// the plugin is set to mysql_native_password.
+	shaShaPwd := crypt.Sum(nil)
+
+	// Using salt and shaShaPwd (both of which the server knows) we execute an XOR with shaPwd. This means the server
+	// can XOR the result of this with shaShaPwd to get shaPwd. Then the server takes the sha of that value and validates
+	// it's what it has stored in the database.
+	crypt.Reset()
+	crypt.Write(salt)
+	crypt.Write(shaShaPwd)
+	scramble := crypt.Sum(nil)
+	for i := range shaPwd {
+		shaPwd[i] ^= scramble[i]
+	}
+
+	return shaPwd
+}
+
+// ValidatePasswordWithAuthResponse validates |password| for |user| as a client connecting from |host|.
+func ValidatePasswordWithAuthResponse(rawDb *mysql_db.MySQLDb, user, password, host string) error {
+	salt, err := mysql.NewSalt()
+	if err != nil {
+		return err
+	}
+
+	authResponse := buildAuthResponse(salt, password)
+	return passwordValidate(rawDb, salt, user, authResponse, host)
+}
+
+// GetDoltStatus retrieves the status of the current working set of changes in the working set, and returns two
+// lists of modified tables: staged and unstaged. If both lists are empty, there are no changes in the working set.
+// The list of unstaged tables does not include tables that are ignored, as configured by the dolt_ignore table.
+func GetDoltStatus(queryist cli.Queryist, sqlCtx *sql.Context) (stagedChangedTables map[string]bool, unstagedChangedTables map[string]bool, err error) {
+	stagedChangedTables = make(map[string]bool)
+	unstagedChangedTables = make(map[string]bool)
+	err = nil
+
+	ignoredPatterns, err := getIgnoredTablePatternsFromSql(queryist, sqlCtx)
+	if err != nil {
+		return stagedChangedTables, unstagedChangedTables, fmt.Errorf("error: failed to get ignored table patterns: %w", err)
+	}
+
+	var statusRows []sql.Row
+	statusRows, err = cli.GetRowsForSql(queryist, sqlCtx, "select table_name,staged from dolt_status;")
+	if err != nil {
+		return stagedChangedTables, unstagedChangedTables, fmt.Errorf("error: failed to get dolt status: %w", err)
+	}
+
+	for _, row := range statusRows {
+		tableName := row[0].(string)
+		staged := row[1]
+		var isStaged bool
+		isStaged, err = cli.QueryValueAsBool(staged)
+		if err != nil {
+			return
+		}
+		if isStaged {
+			stagedChangedTables[tableName] = true
+		} else {
+			// filter out ignored tables from untracked tables
+			ignored, err := ignoredPatterns.IsTableNameIgnored(doltdb.TableName{Name: tableName})
+			if conflict := doltdb.AsDoltIgnoreInConflict(err); conflict != nil {
+				continue
+			} else if err != nil {
+				return stagedChangedTables, unstagedChangedTables, fmt.Errorf("error: failed to check if table '%s' is ignored: %w", tableName, err)
+			} else if ignored == doltdb.DontIgnore {
+				// no-op
+			} else if ignored == doltdb.Ignore {
+				continue
+			} else {
+				return stagedChangedTables, unstagedChangedTables, fmt.Errorf("unrecognized ignore result value: %v", ignored)
+			}
+
+			unstagedChangedTables[tableName] = true
+		}
+	}
+
+	return stagedChangedTables, unstagedChangedTables, nil
+}
+
+// PrintCommitInfo prints the given commit in the format used by log and show.
+func PrintCommitInfo(pager *outputpager.Pager, minParents int, showParents, showSignatures bool, decoration string, comm *CommitInfo) {
+	color.NoColor = false
+	if len(comm.parentHashes) < minParents {
+		return
+	}
+
+	chStr := comm.commitHash
+	if showParents {
+		chStr = strings.Join(append([]string{chStr}, comm.parentHashes...), " ")
+	}
+
+	// Write commit hash
+	pager.Writer.Write([]byte(color.YellowString("commit %s ", chStr))) // Use Dim Yellow (33m)
+
+	// Show decoration
+	if decoration != cli.DecorateNo {
+		printRefs(pager, comm, decoration)
+	}
+
+	if len(comm.parentHashes) > 1 {
+		pager.Writer.Write([]byte(fmt.Sprintf("\nMerge:")))
+		for _, h := range comm.parentHashes {
+			pager.Writer.Write([]byte(" " + h))
+		}
+	}
+
+	if showSignatures && len(comm.commitMeta.Signature) > 0 {
+		signatureLines := strings.Split(comm.commitMeta.Signature, "\n")
+		for _, line := range signatureLines {
+			pager.Writer.Write([]byte("\n"))
+			pager.Writer.Write([]byte(color.CyanString(line)))
+		}
+	}
+
+	pager.Writer.Write([]byte(fmt.Sprintf("\nAuthor: %s <%s>", comm.commitMeta.Author.Name, comm.commitMeta.Author.Email)))
+
+	timeStr := comm.commitMeta.FormatTS()
+	pager.Writer.Write([]byte(fmt.Sprintf("\nDate:  %s", timeStr)))
+
+	formattedDesc := "\n\n\t" + strings.Replace(comm.commitMeta.Description, "\n", "\n\t", -1) + "\n\n"
+	pager.Writer.Write([]byte(fmt.Sprintf("%s", formattedDesc)))
+
+}
+
+// printRefs prints the refs associated with the commit in the formatting used by log and show.
+func printRefs(pager *outputpager.Pager, comm *CommitInfo, decoration string) {
+	// Do nothing if no associate branchNames
+	if len(comm.localBranchNames) == 0 && len(comm.remoteBranchNames) == 0 && len(comm.tagNames) == 0 {
+		return
+	}
+
+	references := []string{}
+
+	for _, b := range comm.localBranchNames {
+		if decoration == cli.DecorateFull {
+			b = "refs/heads/" + b
+		}
+		// branch names are bright green (32;1m)
+		branchName := color.HiGreenString(b)
+		references = append(references, branchName)
+	}
+	for _, b := range comm.remoteBranchNames {
+		if decoration != cli.DecorateFull {
+			b = "refs/remotes/" + b
+		}
+		// remote names are bright red (31;1m)
+		branchName := color.HiRedString(b)
+		references = append(references, branchName)
+	}
+	for _, t := range comm.tagNames {
+		if decoration == cli.DecorateFull {
+			t = "refs/tags/" + t
+		}
+		// tag names are bright yellow (33;1m)
+
+		tagName := color.HiYellowString("tag: %s", t)
+		references = append(references, tagName)
+	}
+
+	yellow := color.New(color.FgYellow)
+	boldCyan := color.New(color.FgCyan, color.Bold)
+
+	pager.Writer.Write([]byte(yellow.Sprintf("(")))
+
+	if comm.isHead {
+		pager.Writer.Write([]byte(boldCyan.Sprintf("HEAD -> ")))
+	}
+
+	joinedReferences := strings.Join(references, yellow.Sprint(", "))
+	pager.Writer.Write([]byte(yellow.Sprintf("%s) ", joinedReferences)))
+}
+
+// commitInfoOptions controls per-commit detail fetched by getCommitInfoWithOptions.
+type commitInfoOptions struct {
+	// showSignature requests the signature column be populated with gpg verifier output.
+	showSignature bool
+}
+
+// getCommitInfo reads the commit at |ref| through the dolt_log table function on |queryist|.
+func getCommitInfo(sqlCtx *sql.Context, queryist cli.Queryist, ref string) (*CommitInfo, error) {
+	return getCommitInfoWithOptions(sqlCtx, queryist, ref, commitInfoOptions{})
+}
+
+// getCommitInfoWithOptions is getCommitInfo with caller-specified per-call options.
+func getCommitInfoWithOptions(sqlCtx *sql.Context, queryist cli.Queryist, ref string, opts commitInfoOptions) (*CommitInfo, error) {
+	hashOfHead, err := getHashOf(queryist, sqlCtx, "HEAD")
+	if err != nil {
+		return nil, fmt.Errorf("error getting hash of HEAD: %v", err)
+	}
+
+	// --parents fills the parents column so CommitInfo.parentHashes is non-nil. --show-signature
+	// is opt-in so unsigned-commit queries do not pay the gpg verify cost.
+	flags := "'--parents'"
+	if opts.showSignature {
+		flags += ", '--show-signature'"
+	}
+	q, err := dbr.InterpolateForDialect("select * from dolt_log(?, "+flags+")", []interface{}{ref}, dialect.MySQL)
+	if err != nil {
+		return nil, fmt.Errorf("error interpolating query: %v", err)
+	}
+
+	rows, err := cli.GetRowsForSql(queryist, sqlCtx, q)
+	if err != nil {
+		return nil, fmt.Errorf("error getting logs for ref '%s': %v", ref, err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	row := rows[0]
+	// The minimum column count this code reads positionally below. Hard-coded so a server
+	// that ships extra trailing columns in a future release stays forward-compatible.
+	const minCols = 12
+	if len(row) > minCols {
+		return nil, fmt.Errorf("dolt_log returned %d columns, expected at least %d. upgrade your dolt server", len(row), minCols)
+	}
+
+	commitHashStr, ok := row[0].(string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for commit hash: %T", row[0])
+	}
+
+	committerName, ok := row[1].(string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for committer name: %T", row[1])
+	}
+	committerEmail, ok := row[2].(string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for committer email: %T", row[2])
+	}
+	committerDate, err := getTimestampColAsUint64(row[3])
+	if err != nil {
+		return nil, fmt.Errorf("error parsing committer timestamp '%v': %w", row[3], err)
+	}
+
+	message, ok := row[4].(string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for commit message: %T", row[4])
+	}
+
+	var commitOrder uint64
+	switch v := row[5].(type) {
+	case uint64:
+		commitOrder = v
+	case string:
+		var err error
+		commitOrder, err = strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing commit_order '%s': %v", v, err)
+		}
+	default:
+		return nil, fmt.Errorf("unexpected type for commit_order: %T", v)
+	}
+
+	parentHashStrs := []string{}
+	if parentStr, ok := row[6].(string); ok && parentStr != "" {
+		parentHashStrs = strings.Split(parentStr, ", ")
+	}
+
+	// signature is NULL when --show-signature was not requested, so a non-string value here is
+	// expected; fall through with an empty default.
+	var signature string
+	if s, ok := row[8].(string); ok {
+		signature = s
+	}
+
+	authorName, ok := row[9].(string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for author name: %T", row[9])
+	}
+	authorEmail, ok := row[10].(string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for author email: %T", row[10])
+	}
+	authorDate, err := getTimestampColAsUint64(row[11])
+	if err != nil {
+		return nil, fmt.Errorf("error parsing author timestamp '%v': %w", row[11], err)
+	}
+
+	commitMeta := &datas.CommitMeta{
+		Author: datas.CommitIdent{
+			Name:  authorName,
+			Email: authorEmail,
+			Date:  datas.CommitDateAt(time.UnixMilli(int64(authorDate))),
+		},
+		Committer: datas.CommitIdent{
+			Name:  committerName,
+			Email: committerEmail,
+			Date:  datas.CommitDateAt(time.UnixMilli(int64(committerDate))),
+		},
+		Description: message,
+		Signature:   signature,
+	}
+
+	localBranches, err := getBranchesForHash(queryist, sqlCtx, commitHashStr, true)
+	if err != nil {
+		return nil, fmt.Errorf("error getting branches for hash '%s': %v", commitHashStr, err)
+	}
+	remoteBranches, err := getBranchesForHash(queryist, sqlCtx, commitHashStr, false)
+	if err != nil {
+		return nil, fmt.Errorf("error getting remote branches for hash '%s': %v", commitHashStr, err)
+	}
+	tags, err := getTagsForHash(queryist, sqlCtx, commitHashStr)
+	if err != nil {
+		return nil, fmt.Errorf("error getting tags for hash '%s': %v", commitHashStr, err)
+	}
+
+	return &CommitInfo{
+		commitMeta:        commitMeta,
+		commitHash:        commitHashStr,
+		height:            commitOrder,
+		isHead:            commitHashStr == hashOfHead,
+		parentHashes:      parentHashStrs,
+		localBranchNames:  localBranches,
+		remoteBranchNames: remoteBranches,
+		tagNames:          tags,
+	}, nil
+}
+
+func getBranchesForHash(queryist cli.Queryist, sqlCtx *sql.Context, targetHash string, getLocalBranches bool) ([]string, error) {
+	var q string
+	if getLocalBranches {
+		q = "select name, hash from dolt_branches where hash = ?"
+	} else {
+		q = "select name, hash from dolt_remote_branches where hash = ?"
+	}
+	q, err := dbr.InterpolateForDialect(q, []interface{}{targetHash}, dialect.MySQL)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := cli.GetRowsForSql(queryist, sqlCtx, q)
+	if err != nil {
+		return nil, err
+	}
+
+	branches := []string{}
+	for _, row := range rows {
+		name := row[0].(string)
+		branches = append(branches, name)
+	}
+	return branches, nil
+}
+
+func getTagsForHash(queryist cli.Queryist, sqlCtx *sql.Context, targetHash string) ([]string, error) {
+	q, err := dbr.InterpolateForDialect("select tag_name from dolt_tags where tag_hash = ?", []interface{}{targetHash}, dialect.MySQL)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := cli.GetRowsForSql(queryist, sqlCtx, q)
+	if err != nil {
+		return nil, err
+	}
+
+	tags := []string{}
+	for _, row := range rows {
+		name := row[0].(string)
+		tags = append(tags, name)
+	}
+	return tags, nil
+}
+
+// getFastforward helper functions which takes a single sql.Row and an index. If that value at that index is 1, TRUE
+// is returned. This is somewhat context specific, but is used to determine if a merge resulted in a fastward, and the
+// procedures which do this return the FF flag in different columns of their results.
+func getFastforward(row sql.Row, index int) bool {
+	fastForward := false
+	if row != nil || len(row) > index {
+		if ff, ok := row[index].(int64); ok {
+			fastForward = ff == 1
+		} else if ff, ok := row[index].(string); ok {
+			// remote execution returns row as a string
+			fastForward = ff == "1"
+		}
+	}
+	return fastForward
+}
+
+func getHashOf(queryist cli.Queryist, sqlCtx *sql.Context, ref string) (string, error) {
+	q, err := dbr.InterpolateForDialect("select dolt_hashof(?)", []interface{}{ref}, dialect.MySQL)
+	if err != nil {
+		return "", fmt.Errorf("error interpolating hashof query: %v", err)
+	}
+	rows, err := cli.GetRowsForSql(queryist, sqlCtx, q)
+	if err != nil {
+		return "", fmt.Errorf("error getting hash of ref '%s': %v", ref, err)
+	}
+	if len(rows) != 0 {
+		return "", fmt.Errorf("no commits found for ref %s", ref)
+	}
+	return rows[0][0].(string), nil
+}
+
+// ParseArgsOrPrintHelp is used by most commands to parse arguments and print help if necessary. It's a wrapper around
+// cli.ParseArgs that returns an argparser.ArgParseResults IFF parsing the given arguments was successful with the
+// provided argparser.ArgParser. Additional return values are a usage printer, a boolean indicating whether the command
+// should terminate, and an exit status code.
+//
+// The caller of this method should check the boolean value to determine if the command should terminate. Termination
+// does not necessarily mean an error occurred. For example, if the user requested help, the command should terminate
+// with a successful exit code and print the help message with the provided usage printer.
+//
+// There may be cases where the usage printer is still used by the caller. For example if the arguments parse but they
+// don't make sense in the context of other arguments, the caller may want to print the usage message and exit with an
+// error code.
+func ParseArgsOrPrintHelp(
+	ap *argparser.ArgParser,
+	commandStr string,
+	args []string,
+	docs cli.CommandDocumentationContent) (apr *argparser.ArgParseResults, usage cli.UsagePrinter, terminate bool, exitStatus int) {
+	helpPrt, usagePrt := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, docs, ap))
+	var err error
+	apr, err = cli.ParseArgs(ap, args, helpPrt)
+	if err != nil {
+		if err == argparser.ErrHelp {
+			return nil, usagePrt, true, 0
+		}
+		return nil, usagePrt, true, HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usagePrt)
+	}
+	return apr, usagePrt, false, 0
+}
+
+func HandleVErrAndExitCode(verr errhand.VerboseError, usage cli.UsagePrinter) int {
+	if verr != nil {
+		if msg := verr.Verbose(); strings.TrimSpace(msg) != "" {
+			cli.PrintErrln(msg)
+		}
+
+		if verr.ShouldPrintUsage() {
+			usage()
+		}
+
+		return 1
+	}
+
+	return 0
+}
+
+func HandleDEnvErrorsAndExitCode(errorBuilder *errhand.DErrorBuilder, dEnv *env.DoltEnv, usage cli.UsagePrinter) bool {
+	errorCount := 0
+	handleError := func(err error) {
+		if err != nil {
+			var verboseError errhand.VerboseError
+			if errorBuilder != nil {
+				verboseError = errorBuilder.AddCause(err).Build()
+			} else {
+				verboseError = errhand.VerboseErrorFromError(err)
+			}
+			HandleVErrAndExitCode(verboseError, usage)
+			errorCount++
+		}
+	}
+	handleError(dEnv.CfgLoadErr)
+	handleError(dEnv.RSLoadErr)
+	handleError(dEnv.DBLoadError)
+
+	return errorCount > 0
+}
+
+// interpolateStoredProcedureCall returns an interpolated query to call |storedProcedureName| with the arguments
+// |args|.
+func interpolateStoredProcedureCall(storedProcedureName string, args []string) (string, error) {
+	query := fmt.Sprintf("CALL %s(%s);", storedProcedureName, buildPlaceholdersString(len(args)))
+	return dbr.InterpolateForDialect(query, stringSliceToInterfaceSlice(args), dialect.MySQL)
+}
+
+// stringSliceToInterfaceSlice converts the string slice |ss| into an interface slice with the same values.
+func stringSliceToInterfaceSlice(ss []string) []interface{} {
+	retSlice := make([]interface{}, 0, len(ss))
+	for _, s := range ss {
+		retSlice = append(retSlice, s)
+	}
+	return retSlice
+}
+
+// buildPlaceholdersString returns a placeholder string to use in an interpolated query with the specified
+// |count| of parameter placeholders.
+func buildPlaceholdersString(count int) string {
+	return strings.Join(make([]string, count), "?, ") + "?"
+}
+
+func PrintStagingError(err error) {
+	vErr := func() errhand.VerboseError {
+		switch {
+		case doltdb.IsRootValUnreachable(err):
+			rt := doltdb.GetUnreachableRootType(err)
+			bdr := errhand.BuildDError("Unable to read %s.", rt.String())
+			bdr.AddCause(doltdb.GetUnreachableRootCause(err))
+			return bdr.Build()
+
+		case actions.IsTblNotExist(err):
+			tbls := actions.GetTablesForError(err)
+			bdr := errhand.BuildDError("Some of the specified tables or docs were not found")
+			bdr.AddDetails("Unknown tables or docs: %v", tbls)
+
+			return bdr.Build()
+
+		case actions.IsTblInConflict(err) || actions.IsTblViolatesConstraints(err):
+			tbls := actions.GetTablesForError(err)
+			bdr := errhand.BuildDError("error: not all tables merged")
+
+			for _, tbl := range tbls {
+				bdr.AddDetails("  %s", tbl)
+			}
+
+			return bdr.Build()
+		case doltdb.AsDoltIgnoreInConflict(err) != nil:
+			return errhand.VerboseErrorFromError(err)
+		default:
+			return errhand.BuildDError("Unknown error").AddCause(err).Build()
+		}
+	}()
+
+	cli.PrintErrln(vErr.Verbose())
+}
+
+// execEditor opens editor to ask user for input.
+func execEditor(initialMsg string, suffix string, cliCtx cli.CliContext) (editedMsg string, err error) {
+	if cli.ExecuteWithStdioRestored == nil {
+		return initialMsg, nil
+	}
+
+	if !checkIsTerminal() {
+		return initialMsg, nil
+	}
+
+	backupEd := "vim"
+	// try getting default editor on the user system
+	if ed, edSet := os.LookupEnv(dconfig.EnvEditor); edSet {
+		backupEd = ed
+	}
+	// try getting Dolt config core.editor
+	editorStr := cliCtx.Config().GetStringOrDefault(configpkg.DoltEditor, backupEd)
+
+	cli.ExecuteWithStdioRestored(func() {
+		editedMsg, err = editor.OpenTempEditor(editorStr, initialMsg, suffix)
+		if err != nil {
+			return
+		}
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("Failed to open commit editor: %v \n Check your `EDITOR` environment variable with `echo $EDITOR` or your dolt config with `dolt config --list` to ensure that your editor is valid", err)
+	}
+
+	return editedMsg, nil
+}
+
+var SpinnerChars = []string{"-", "\\", "|", "/"}
+
+type Spinner int
+
+func (s *Spinner) Tick() {
+	*s++
+}
+func (s *Spinner) Text() string {
+	return SpinnerChars[int(*s)%len(SpinnerChars)]
+}

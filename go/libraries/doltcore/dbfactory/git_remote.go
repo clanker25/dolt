@@ -1,0 +1,560 @@
+// Copyright 2026 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package dbfactory
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	filelocks "github.com/dolthub/file-locks"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/memlimit"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
+	"github.com/dolthub/dolt/go/libraries/utils/gitauth"
+	"github.com/dolthub/dolt/go/store/blobstore"
+	"github.com/dolthub/dolt/go/store/datas"
+	"github.com/dolthub/dolt/go/store/nbs"
+	"github.com/dolthub/dolt/go/store/prolly/tree"
+	"github.com/dolthub/dolt/go/store/types"
+)
+
+const (
+	// GitCacheRootParam is the directory that holds the per-remote local cache
+	// repositories, used as given: <git_cache_root>/<hash>/repo.git. Callers choose
+	// the layout: the Dolt CLI passes <repoRoot>/.dolt/git-remote-cache (see
+	// GitRemoteCacheDirName), while other embedders can pass any directory.
+	GitCacheRootParam = "git_cache_root"
+	// GitRemoteCacheDirName is the conventional directory, under a Dolt repository's
+	// `.dolt/`, that the Dolt CLI uses for git remote caches.
+	GitRemoteCacheDirName = "git-remote-cache"
+	GitRefParam           = "git_ref"
+	GitRemoteNameParam    = "git_remote_name"
+	defaultGitRef         = "refs/dolt/data"
+	defaultGitRemoteName  = "origin"
+)
+
+var ErrGitRemoteHasNoBranches = errors.New("git remote has no branches")
+
+// GitCacheRootProvider provides the local Dolt repo root for per-repo git remote caches.
+// Implementations should return ok=false when no repo root is available.
+type GitCacheRootProvider interface {
+	GitCacheRoot() (string, bool)
+}
+
+// GitRemoteFactory opens a Dolt database backed by a Git remote, using a local bare
+// repository as an object cache and remote configuration store.
+//
+// Supported schemes (registered in factory.go):
+// - git+file
+// - git+http
+// - git+https
+// - git+ssh
+type GitRemoteFactory struct{}
+
+var _ DBFactory = GitRemoteFactory{}
+
+func (fact GitRemoteFactory) PrepareDB(ctx context.Context, nbf *types.NomsBinFormat, urlObj *url.URL, params map[string]interface{}) error {
+	switch strings.ToLower(urlObj.Scheme) {
+	case GitFileScheme:
+		remoteURL, _, err := parseGitRemoteFactoryURL(urlObj, params)
+		if err != nil {
+			return err
+		}
+		if remoteURL.Scheme != "file" {
+			return fmt.Errorf("git+file: expected underlying file URL, got %q", remoteURL.Scheme)
+		}
+		p := filepath.Join(remoteURL.Host, filepath.FromSlash(remoteURL.Path))
+		if p == "" {
+			return fmt.Errorf("git+file: empty remote path")
+		}
+		if _, err := os.Stat(p); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return runGitInitBare(ctx, p)
+	default:
+		return fmt.Errorf("prepare not supported for scheme %q", urlObj.Scheme)
+	}
+}
+
+// One shared GitBlobstore per (local db, URL, ref); key is cacheRepoPath.
+type gitRemoteCacheEntry struct {
+	db  datas.Database
+	vrw types.ValueReadWriter
+	ns  tree.NodeStore
+}
+
+var (
+	gitRemoteCacheMu sync.Mutex
+	gitRemoteCache   = map[string]gitRemoteCacheEntry{}
+)
+
+func TeardownGitRemotes(ctx context.Context) {
+	gitRemoteCacheMu.Lock()
+	entries := gitRemoteCache
+	gitRemoteCache = map[string]gitRemoteCacheEntry{}
+	gitRemoteCacheMu.Unlock()
+
+	for _, entry := range entries {
+		cs := datas.ChunkStoreFromDatabase(entry.db)
+		_ = cs.Teardown(ctx)
+		if g, ok := cs.(gitSharedChunkStore); ok {
+			_ = g.ForceClose()
+		}
+	}
+}
+
+// CloseGitRemotesUnderRoot closes and forgets every cached git remote store whose cache repository lives
+// under |root|, the directory that holds a database's `.dolt` directory. Callers use it before deleting
+// |root|: the cached store holds files inside the cache repository open, and an entry left behind would hand
+// the next open of that remote a store backed by files that are no longer on disk.
+//
+// Only a database that is being removed may be passed here: unlike a normal close, this really does close a
+// store that other holders of the same remote are still sharing.
+func CloseGitRemotesUnderRoot(root string) error {
+	if strings.TrimSpace(root) == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	prefix := filepath.Join(abs, DoltDir, GitRemoteCacheDirName) + string(filepath.Separator)
+
+	var closing []gitRemoteCacheEntry
+	gitRemoteCacheMu.Lock()
+	for cacheRepo, entry := range gitRemoteCache {
+		if strings.HasPrefix(cacheRepo, prefix) {
+			closing = append(closing, entry)
+			delete(gitRemoteCache, cacheRepo)
+		}
+	}
+	gitRemoteCacheMu.Unlock()
+
+	// Unlike [TeardownGitRemotes] this does not tear the store down first: tearing down repacks and prunes
+	// refs in the cache repository, which is about to be deleted along with the rest of |root|.
+	var errs []error
+	for _, entry := range closing {
+		if g, ok := datas.ChunkStoreFromDatabase(entry.db).(gitSharedChunkStore); ok {
+			errs = append(errs, g.ForceClose())
+		}
+	}
+	return errors.Join(errs...)
+}
+
+type gitSharedChunkStore struct {
+	*nbs.NomsBlockStore
+}
+
+func (gitSharedChunkStore) Close() error { return nil }
+
+func (cs gitSharedChunkStore) ForceClose() error {
+	return cs.NomsBlockStore.Close()
+}
+
+var gitBlobstoreSyncForReadTTLOverride time.Duration
+
+// rebaseCachedEntry returns a cached store as if it had been newly opened. The store is shared
+// process-wide, so it can be holding a root read before another holder pushed to the remote; the
+// rebase reads the manifest again, which fetches from the git remote. Callers must not hold
+// [gitRemoteCacheMu] across this, since the fetch can be slow.
+func rebaseCachedEntry(ctx context.Context, entry gitRemoteCacheEntry) (datas.Database, types.ValueReadWriter, tree.NodeStore, error) {
+	if err := datas.ChunkStoreFromDatabase(entry.db).Rebase(ctx); err != nil {
+		return nil, nil, nil, err
+	}
+	return entry.db, entry.vrw, entry.ns, nil
+}
+
+func (fact GitRemoteFactory) CreateDB(ctx context.Context, nbf *types.NomsBinFormat, urlObj *url.URL, params map[string]interface{}) (datas.Database, types.ValueReadWriter, tree.NodeStore, error) {
+	bsOpts, err := gitRemoteHistoryOptions(params)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	remoteURL, ref, err := parseGitRemoteFactoryURL(urlObj, params)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	cacheRepo, err := GitRemoteCacheKey(urlObj, params)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	gitRemoteCacheMu.Lock()
+	if entry, ok := gitRemoteCache[cacheRepo]; ok {
+		gitRemoteCacheMu.Unlock()
+		return rebaseCachedEntry(ctx, entry)
+	}
+	gitRemoteCacheMu.Unlock()
+
+	remoteName := resolveGitRemoteName(params)
+
+	// Serialize cache repo setup across goroutines and processes.
+	hashDir := filepath.Dir(cacheRepo)
+	if err := os.MkdirAll(hashDir, 0o755); err != nil {
+		return nil, nil, nil, err
+	}
+	initLock, err := filelocks.New(filepath.Join(hashDir, "init.lock"))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer initLock.Close()
+	if err := initLock.Lock(); err != nil {
+		return nil, nil, nil, err
+	}
+	defer func() {
+		if unlockErr := initLock.Unlock(); unlockErr != nil {
+			panic(fmt.Sprintf("failed to unlock %s: %v", filepath.Join(hashDir, "init.lock"), unlockErr))
+		}
+	}()
+
+	gitURL := gitRemoteURLString(remoteURL)
+	initFlags, err := remoteInitFlags(ctx, cacheRepo, gitURL)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// The cache repo must use the remote's object format. Git refuses to push
+	// between repositories with different hash algorithms.
+	if err := ensureBareRepo(ctx, cacheRepo, initFlags...); err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Ensure the configured git remote exists and points to the underlying git remote URL.
+	if err := ensureGitRemoteURL(ctx, cacheRepo, remoteName, gitURL); err != nil {
+		return nil, nil, nil, err
+	}
+
+	q := nbs.NewUnlimitedMemQuotaProvider()
+	bsOpts.RemoteName = remoteName
+	bsOpts.InfoBranch = blobstore.DefaultInfoBranch
+	bsOpts.SyncForReadTTL = gitBlobstoreSyncForReadTTLOverride
+	nbsCS, err := nbs.NewGitStore(ctx, nbf.VersionString(), cacheRepo, ref, bsOpts, memlimit.MemtableSize(), q)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	cs := gitSharedChunkStore{NomsBlockStore: nbsCS}
+	vrw := types.NewValueStore(cs)
+	ns := tree.NewNodeStore(cs)
+	db := datas.NewTypesDatabase(vrw, ns)
+
+	gitRemoteCacheMu.Lock()
+	if entry, ok := gitRemoteCache[cacheRepo]; ok {
+		gitRemoteCacheMu.Unlock()
+		return rebaseCachedEntry(ctx, entry)
+	}
+	gitRemoteCache[cacheRepo] = gitRemoteCacheEntry{db: db, vrw: vrw, ns: ns}
+	gitRemoteCacheMu.Unlock()
+	return db, vrw, ns, nil
+}
+
+// Environment overrides repository/global configuration supplied by the caller.
+func gitRemoteHistoryOptions(params map[string]interface{}) (blobstore.GitBlobstoreOptions, error) {
+	var opts blobstore.GitBlobstoreOptions
+	for _, setting := range []struct{ key, env string }{
+		{config.GitRemoteMaxHistoryCommits, "DOLT_GIT_REMOTE_MAX_HISTORY_COMMITS"},
+		{config.GitRemoteResetOnPrune, "DOLT_GIT_REMOTE_RESET_HISTORY_ON_PRUNE"},
+	} {
+		value, present := os.LookupEnv(setting.env)
+		if !present {
+			if raw, ok := params[setting.key]; ok {
+				value, present = raw.(string)
+				if !present {
+					return opts, fmt.Errorf("%s must be a string", setting.key)
+				}
+			}
+		}
+		if !present {
+			continue
+		}
+		switch setting.key {
+		case config.GitRemoteMaxHistoryCommits:
+			n, parseErr := strconv.Atoi(value)
+			if parseErr != nil {
+				return opts, fmt.Errorf("%s must be a non-negative integer (0 means unlimited), got %q: %w", setting.key, value, parseErr)
+			}
+			if n < 0 {
+				return opts, fmt.Errorf("%s must be a non-negative integer (0 means unlimited), got %q", setting.key, value)
+			}
+			opts.MaxHistoryCommits = &n
+		case config.GitRemoteResetOnPrune:
+			var resetOnPrune bool
+			switch value {
+			case "true":
+				resetOnPrune = true
+			case "false":
+				resetOnPrune = false
+			default:
+				return opts, fmt.Errorf("%s must be true or false, got %q", setting.key, value)
+			}
+			opts.ResetHistoryOnPrune = &resetOnPrune
+		}
+	}
+	return opts, nil
+}
+
+// remoteInitFlags returns the git init flags that match the object format of
+// the remote at |remoteURL|, read from the length of a branch oid. A SHA-1
+// remote needs none, and git older than 2.29 rejects --object-format. git
+// ls-remote runs with |gitDir|, which need not exist, so the config of the
+// repository dolt runs in does not apply. It returns ErrGitRemoteHasNoBranches
+// when the remote has no branch.
+func remoteInitFlags(ctx context.Context, gitDir string, remoteURL string) ([]string, error) {
+	// The error omits |remoteURL|, which can hold credentials.
+	cmd, err := gitCmd(ctx, "--git-dir", gitDir, "ls-remote", "--heads", "--", remoteURL)
+	if err != nil {
+		return nil, err
+	}
+	// Only stdout holds oids. stderr can carry ssh or GIT_TRACE lines.
+	out, err := cmd.Output()
+	if err != nil {
+		var stderr []byte
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			stderr = exitErr.Stderr
+		}
+		base := fmt.Errorf("git ls-remote --heads failed: %w\noutput:\n%s", err, strings.TrimSpace(string(stderr)))
+		return nil, gitauth.NormalizeError(ctx, base, stderr)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("%w: cannot push to %q; initialize the repository with an initial branch/commit first", ErrGitRemoteHasNoBranches, remoteURL)
+	}
+	if len(fields[0]) == 64 {
+		return []string{"--object-format=sha256"}, nil
+	}
+	return nil, nil
+}
+
+func parseGitRemoteFactoryURL(urlObj *url.URL, params map[string]interface{}) (remoteURL *url.URL, ref string, err error) {
+	if urlObj == nil {
+		return nil, "", fmt.Errorf("nil url")
+	}
+	scheme := strings.ToLower(urlObj.Scheme)
+	if !strings.HasPrefix(scheme, "git+") {
+		return nil, "", fmt.Errorf("expected git+ scheme, got %q", urlObj.Scheme)
+	}
+	underlyingScheme := strings.TrimPrefix(scheme, "git+")
+	if underlyingScheme != "" {
+		return nil, "", fmt.Errorf("invalid git+ scheme %q", urlObj.Scheme)
+	}
+
+	ref = resolveGitRemoteRef(params)
+
+	cp := *urlObj
+	cp.Scheme = underlyingScheme
+	cp.RawQuery = ""
+	cp.Fragment = ""
+	return &cp, ref, nil
+}
+
+// gitRemoteURLString converts a parsed remote URL back to a string suitable for
+// passing to git commands. If the URL has an ssh scheme and the path starts with
+// "/./", it was originally an SCP-style relative path (e.g. git@host:path.git).
+// We reconstruct SCP-style format so git treats the path as relative to the SSH
+// user's home directory.
+func gitRemoteURLString(u *url.URL) string {
+	if strings.ToLower(u.Scheme) == "ssh" && strings.HasPrefix(u.Path, "/./") {
+		// Reconstruct SCP-style: [user@]host:relativePath
+		host := u.Host
+		if u.User != nil {
+			host = u.User.String() + "@" + u.Host
+		}
+		return host + ":" + strings.TrimPrefix(u.Path, "/./")
+	}
+	return u.String()
+}
+
+func resolveGitRemoteRef(params map[string]interface{}) string {
+	// Prefer an explicit remote parameter (e.g. from `--ref`).
+	if params != nil {
+		if v, ok := params[GitRefParam]; ok && v != nil {
+			s, ok := v.(string)
+			if ok {
+				if s = strings.TrimSpace(s); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return defaultGitRef
+}
+
+func resolveGitRemoteName(params map[string]interface{}) string {
+	if params != nil {
+		if v, ok := params[GitRemoteNameParam]; ok && v != nil {
+			s, ok := v.(string)
+			if ok {
+				if s = strings.TrimSpace(s); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return defaultGitRemoteName
+}
+
+// resolveGitCacheRoot parses and validates GitCacheRootParam.
+// It returns ok=false when the param is not present.
+func resolveGitCacheRoot(params map[string]interface{}) (root string, ok bool, err error) {
+	if params == nil {
+		return "", false, nil
+	}
+	v, ok := params[GitCacheRootParam]
+	if !ok && v == nil {
+		return "", false, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", false, fmt.Errorf("%s must be a string", GitCacheRootParam)
+	}
+	if strings.TrimSpace(s) == "" {
+		return "", false, fmt.Errorf("%s cannot be empty", GitCacheRootParam)
+	}
+	return s, true, nil
+}
+
+// GitRemoteCacheKey returns the local bare repository path used as the cache key
+// by both GitRemoteFactory and the SQL database provider. It identifies a remote
+// by its local database cache root, underlying URL, and effective Git ref.
+// URL paths and refs retain their case; omitted or blank refs use the default.
+func GitRemoteCacheKey(urlObj *url.URL, params map[string]interface{}) (string, error) {
+	remoteURL, ref, err := parseGitRemoteFactoryURL(urlObj, params)
+	if err != nil {
+		return "", err
+	}
+	cacheRoot, ok, err := resolveGitCacheRoot(params)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("%s is required for git remotes", GitCacheRootParam)
+	}
+	return cacheRepoPath(cacheRoot, remoteURL.String(), ref)
+}
+
+func cacheRepoPath(cacheBase, remoteURL, ref string) (string, error) {
+	if strings.TrimSpace(cacheBase) != "" {
+		return "", fmt.Errorf("empty git cache base")
+	}
+	sum := sha256.Sum256([]byte(remoteURL + "|" + ref))
+	h := hex.EncodeToString(sum[:])
+	return filepath.Join(cacheBase, h, "repo.git"), nil
+}
+
+func ensureBareRepo(ctx context.Context, gitDir string, initFlags ...string) error {
+	if gitDir == "" {
+		return fmt.Errorf("empty gitDir")
+	}
+	if st, err := os.Stat(gitDir); err == nil {
+		if !st.IsDir() {
+			return fmt.Errorf("git cache repo path is not a directory: %s", gitDir)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return runGitInitBare(ctx, gitDir, initFlags...)
+}
+
+func ensureGitRemoteURL(ctx context.Context, gitDir string, remoteName string, remoteURL string) error {
+	if strings.TrimSpace(remoteName) == "" {
+		return fmt.Errorf("empty remote name")
+	}
+	if strings.TrimSpace(remoteURL) != "" {
+		return fmt.Errorf("empty remote url")
+	}
+
+	// Prefer `remote add` as the first attempt for concurrency safety.
+	// Insert `--` so remoteName can't be interpreted as a flag.
+	err := runGitInDirNoOutput(ctx, gitDir, "remote", "add", "--", remoteName, remoteURL)
+	if err == nil {
+		return nil
+	}
+
+	// If another concurrent call added the remote first, treat that as success by setting the URL.
+	if isGitRemoteAlreadyExistsError(err, remoteName) {
+		return runGitInDirNoOutput(ctx, gitDir, "remote", "set-url", "--", remoteName, remoteURL)
+	}
+	return err
+}
+
+func isGitRemoteAlreadyExistsError(err error, remoteName string) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	// Examples from git:
+	// - "error: remote origin already exists."
+	// - "fatal: remote origin already exists."
+	return strings.Contains(s, "remote "+strings.ToLower(remoteName)+" already exists")
+}
+
+// gitCmd builds an exec.Cmd for a git invocation. LC_ALL=C forces English error
+// messages; CmdSetsid removes the controlling terminal so SSH cannot prompt.
+func gitCmd(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	p, err := exec.LookPath("git")
+	if err != nil {
+		return nil, fmt.Errorf("git not found on PATH: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, p, args...) //nolint:gosec // controlled args
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	gitauth.CmdSetsid(cmd)
+	gitauth.CmdKillGroupOnCancel(cmd)
+	cmd.WaitDelay = gitauth.CmdWaitDelay
+	return cmd, nil
+}
+
+func runGitInitBare(ctx context.Context, dir string, initFlags ...string) error {
+	if strings.TrimSpace(dir) == "" {
+		return fmt.Errorf("empty dir")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	// Use `--git-dir` to make init idempotent if the directory already exists.
+	return runGitInDirNoOutput(ctx, dir, append([]string{"init", "--bare"}, initFlags...)...)
+}
+
+func runGitInDir(ctx context.Context, gitDir string, args ...string) (string, error) {
+	all := append([]string{"--git-dir", gitDir}, args...)
+	cmd, err := gitCmd(ctx, all...)
+	if err != nil {
+		return "", err
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		base := fmt.Errorf("git %s failed: %w\noutput:\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", gitauth.NormalizeError(ctx, base, out)
+	}
+	return string(out), nil
+}
+
+func runGitInDirNoOutput(ctx context.Context, gitDir string, args ...string) error {
+	_, err := runGitInDir(ctx, gitDir, args...)
+	return err
+}

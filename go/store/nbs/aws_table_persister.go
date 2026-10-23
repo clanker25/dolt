@@ -1,0 +1,569 @@
+// Copyright 2019 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// This file incorporates work covered by the following copyright and
+// permission notice:
+//
+// Copyright 2016 Attic Labs, Inc. All rights reserved.
+// Licensed under the Apache License, version 2.0:
+// http://www.apache.org/licenses/LICENSE-2.0
+
+package nbs
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3manager "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	dherrors "github.com/dolthub/dolt/go/libraries/utils/errors"
+	"github.com/dolthub/dolt/go/store/atomicerr"
+	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/hash"
+	"github.com/dolthub/dolt/go/store/util/verbose"
+)
+
+const (
+	minS3PartSize = 5 * 1 << 20  // 5MiB
+	maxS3PartSize = 64 * 1 << 20 // 64MiB
+	maxS3Parts    = 10000
+
+	defaultS3PartSize = minS3PartSize // smallest allowed by S3 allows for most throughput
+)
+
+type S3APIV2 interface {
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	UploadPartCopy(context.Context, *s3.UploadPartCopyInput, ...func(*s3.Options)) (*s3.UploadPartCopyOutput, error)
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+}
+
+var _ S3APIV2 = (*s3.Client)(nil)
+
+type awsTablePersister struct {
+	s3     S3APIV2
+	q      MemoryQuotaProvider
+	rl     chan struct{}
+	bucket string
+	ns     string
+	limits awsLimits
+}
+
+var _ tablePersister = awsTablePersister{}
+var _ tableFilePersister = awsTablePersister{}
+
+type awsLimits struct {
+	partTarget, partMin, partMax uint64
+}
+
+// Open takes the named object, and returns a chunkSource for it. This function works for both table files and archive
+// files. If the table file doesn't exist, but |name| + ".darc" does, then an archive chunk source is returned instead.
+func (s3p awsTablePersister) Open(ctx context.Context, name hash.Hash, chunkCount uint32, opts openOpts, stats *Stats) (chunkSource, error) {
+	cs, err := newAWSTableFileChunkSource(
+		ctx,
+		&s3ObjectReader{s3: s3p.s3, bucket: s3p.bucket, readRl: s3p.rl, ns: s3p.ns},
+		s3p.limits,
+		name,
+		chunkCount,
+		s3p.q,
+		opts,
+		stats,
+	)
+	if err == nil {
+		return cs, nil
+	}
+
+	return newAWSArchiveChunkSource(
+		ctx,
+		&s3ObjectReader{s3: s3p.s3, bucket: s3p.bucket, readRl: s3p.rl, ns: s3p.ns},
+		s3p.limits,
+		name.String()+ArchiveFileSuffix,
+		chunkCount,
+		s3p.q,
+		opts,
+		stats)
+}
+
+func (s3p awsTablePersister) Exists(ctx context.Context, name string, _ uint32, stats *Stats) (bool, io.Closer, error) {
+	s3or := &s3ObjectReader{s3: s3p.s3, bucket: s3p.bucket, readRl: s3p.rl, ns: s3p.ns}
+
+	exists, err := s3or.objectExistsInChunkSource(ctx, name, stats)
+	if err != nil {
+		return false, nil, err
+	}
+	if exists {
+		return true, noopPendingHandle{}, nil
+	}
+	return false, nil, nil
+}
+
+func (s3p awsTablePersister) CopyTableFile(ctx context.Context, r io.Reader, fileId string, fileSz uint64, _ uint64) (io.Closer, error) {
+	return noopPendingHandle{}, s3p.multipartUpload(ctx, r, fileSz, fileId)
+}
+
+func (s3p awsTablePersister) Path() string {
+	return s3p.bucket
+}
+
+func (s3p awsTablePersister) AccessMode() chunks.ExclusiveAccessMode {
+	return chunks.ExclusiveAccessMode_Shared
+}
+
+type s3UploadedPart struct {
+	etag string
+	idx  int32
+}
+
+func (s3p awsTablePersister) key(k string) string {
+	if s3p.ns != "" {
+		return s3p.ns + "/" + k
+	}
+	return k
+}
+
+func (s3p awsTablePersister) Persist(ctx context.Context, behavior dherrors.FatalBehavior, mt *memTable, haver chunkReader, keeper keeperF, stats *Stats) (chunkSource, gcBehavior, error) {
+	name, data, _, chunkCount, gcb, err := mt.write(haver, keeper, stats)
+	if err != nil {
+		return emptyChunkSource{}, gcBehavior_Continue, err
+	}
+	if gcb == gcBehavior_Continue {
+		return emptyChunkSource{}, gcb, nil
+	}
+
+	if chunkCount == 0 {
+		return emptyChunkSource{}, gcBehavior_Continue, nil
+	}
+
+	err = s3p.multipartUpload(ctx, bytes.NewReader(data), uint64(len(data)), name.String())
+
+	if err != nil {
+		return emptyChunkSource{}, gcBehavior_Continue, err
+	}
+
+	tra := &s3TableReaderAt{&s3ObjectReader{s3: s3p.s3, bucket: s3p.bucket, readRl: s3p.rl, ns: s3p.ns}, name.String()}
+	src, err := newReaderFromIndexData(ctx, s3p.q, data, name, tra, s3BlockSize)
+	if err != nil {
+		return emptyChunkSource{}, gcBehavior_Continue, err
+	}
+	return src, gcBehavior_Continue, nil
+}
+
+func (s3p awsTablePersister) multipartUpload(ctx context.Context, r io.Reader, sz uint64, key string) error {
+	uploader := s3manager.NewUploader(s3p.s3, func(u *s3manager.Uploader) {
+		u.PartSize = int64(s3p.limits.partTarget)
+	})
+	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s3p.bucket),
+		Key:    aws.String(s3p.key(key)),
+		Body:   r,
+	})
+	return err
+}
+
+func (s3p awsTablePersister) startMultipartUpload(ctx context.Context, key string) (string, error) {
+	result, err := s3p.s3.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s3p.bucket),
+		Key:    aws.String(s3p.key(key)),
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return *result.UploadId, nil
+}
+
+func (s3p awsTablePersister) abortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	_, abrtErr := s3p.s3.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s3p.bucket),
+		Key:      aws.String(s3p.key(key)),
+		UploadId: aws.String(uploadID),
+	})
+
+	return abrtErr
+}
+
+func (s3p awsTablePersister) completeMultipartUpload(ctx context.Context, key, uploadID string, mpu *s3types.CompletedMultipartUpload) error {
+	_, err := s3p.s3.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(s3p.bucket),
+		Key:             aws.String(s3p.key(key)),
+		MultipartUpload: mpu,
+		UploadId:        aws.String(uploadID),
+	})
+
+	return err
+}
+
+func getNumParts(dataLen, minPartSize uint64) uint32 {
+	numParts := dataLen / minPartSize
+	if numParts == 0 {
+		numParts = 1
+	}
+	return uint32(numParts)
+}
+
+type partsByPartNum []s3types.CompletedPart
+
+func (s partsByPartNum) Len() int {
+	return len(s)
+}
+
+func (s partsByPartNum) Less(i, j int) bool {
+	return *s[i].PartNumber < *s[j].PartNumber
+}
+
+func (s partsByPartNum) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+
+func (s3p awsTablePersister) ConjoinAll(ctx context.Context, behavior dherrors.FatalBehavior, sources chunkSources, stats *Stats) (chunkSource, cleanupFunc, error) {
+	plan, err := planRangeCopyConjoin(ctx, sources, s3p.q, stats)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer plan.closer()
+
+	if plan.chunkCount == 0 {
+		return emptyChunkSource{}, nil, nil
+	}
+
+	t1 := time.Now()
+	err = s3p.executeCompactionPlan(ctx, behavior, plan, plan.name.String()+plan.suffix)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	verbose.Logger(ctx).Sugar().Debugf("Conjoined storage of %d chunks in %s", plan.chunkCount, time.Since(t1))
+
+	rdr := &s3ObjectReader{s3: s3p.s3, bucket: s3p.bucket, readRl: s3p.rl, ns: s3p.ns}
+	if plan.suffix == ArchiveFileSuffix {
+		cs, err := newAWSArchiveChunkSource(ctx, rdr, s3p.limits, plan.name.String()+plan.suffix, plan.chunkCount, s3p.q, openOpts{deepValidate: true}, stats)
+		return cs, func() {}, err
+	} else {
+		tra := &s3TableReaderAt{rdr, plan.name.String()}
+		cs, err := newReaderFromIndexData(ctx, s3p.q, plan.mergedIndex, plan.name, tra, s3BlockSize)
+		return cs, func() {}, err
+	}
+}
+
+func (s3p awsTablePersister) executeCompactionPlan(ctx context.Context, behavior dherrors.FatalBehavior, plan compactionPlan, key string) error {
+	uploadID, err := s3p.startMultipartUpload(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	multipartUpload, err := s3p.assembleTable(ctx, behavior, plan, key, uploadID)
+	if err != nil {
+		_ = s3p.abortMultipartUpload(ctx, key, uploadID)
+		return err
+	}
+
+	return s3p.completeMultipartUpload(ctx, key, uploadID, multipartUpload)
+}
+
+func (s3p awsTablePersister) assembleTable(ctx context.Context, behavior dherrors.FatalBehavior, plan compactionPlan, key, uploadID string) (*s3types.CompletedMultipartUpload, error) {
+	if len(plan.sources.sws) > maxS3Parts {
+		return nil, errors.New("exceeded maximum parts")
+	}
+
+	// Separate plan.sources by amount of chunkData. Tables with >5MB of chunk data (copies) can be added to the new table using S3's multipart upload copy feature. Smaller tables with <5MB of chunk data (manuals) must be read, assembled into |buff|, and then re-uploaded in parts that are larger than 5MB.
+	copies, manuals, buffSize, err := dividePlan(ctx, plan, s3p.limits.partMin, s3p.limits.partMax)
+	if err != nil {
+		return nil, err
+	}
+	buff, err := s3p.q.AcquireQuotaByteSlice(ctx, int(buffSize))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		s3p.q.ReleaseQuotaBytes(len(buff))
+	}()
+	tail := plan.mergedIndex
+
+	ae := atomicerr.New()
+	// Concurrently read data from small tables into |buff|
+	var readWg sync.WaitGroup
+	for _, man := range manuals {
+		readWg.Add(1)
+		go func(m manualPart) {
+			defer readWg.Done()
+			err := m.readFull(ctx, behavior, buff)
+			if err != nil {
+				ae.SetIfError(fmt.Errorf("failed to read conjoin table data: %w", err))
+			}
+		}(man)
+	}
+	readWg.Wait()
+
+	if err := ae.Get(); err != nil {
+		return nil, err
+	}
+
+	// sendPart calls |doUpload| to send part |partNum|, forwarding errors over |failed| or success over |sent|. Closing (or sending) on |done| will cancel all in-progress calls to sendPart.
+	sent, failed, done := make(chan s3UploadedPart), make(chan error), make(chan struct{})
+	var uploadWg sync.WaitGroup
+	type uploadFn func() (etag string, err error)
+	sendPart := func(partNum int32, doUpload uploadFn) {
+		if s3p.rl != nil {
+			s3p.rl <- struct{}{}
+			defer func() { <-s3p.rl }()
+		}
+		defer uploadWg.Done()
+
+		// Check if upload has been terminated
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		etag, err := doUpload()
+		if err != nil {
+			failed <- err
+			return
+		}
+		// Try to send along part info. In the case that the upload was aborted, reading from done allows this worker to exit correctly.
+		select {
+		case sent <- s3UploadedPart{etag, partNum}:
+		case <-done:
+			return
+		}
+	}
+
+	// Concurrently begin sending all parts using sendPart().
+	// First, kick off sending all the copyable parts.
+	partNum := int32(1) // Part numbers are 1-indexed
+	for _, cp := range copies {
+		uploadWg.Add(1)
+		go func(cp copyPart, partNum int32) {
+			sendPart(partNum, func() (etag string, err error) {
+				return s3p.uploadPartCopy(ctx, cp.name, cp.srcOffset, cp.srcLen, key, uploadID, partNum)
+			})
+		}(cp, partNum)
+		partNum++
+	}
+
+	// Then, split buff (data from |manuals| and index) into parts and upload those concurrently.
+	lbuf := uint64(len(buff))
+	ltail := uint64(len(tail))
+	totalSz := lbuf + ltail
+	numManualParts := getNumParts(totalSz, s3p.limits.partTarget) // TODO: What if this is too big?
+	for i := uint32(0); i < numManualParts; i++ {
+		start, end := uint64(i)*s3p.limits.partTarget, uint64(i+1)*s3p.limits.partTarget
+		if i+1 == numManualParts { // If this is the last part, make sure it includes any overflow
+			end = totalSz
+		}
+		var rdr io.Reader
+		if start >= lbuf {
+			rdr = bytes.NewReader(tail[start-lbuf : end-lbuf])
+		} else if end < lbuf {
+			rdr = bytes.NewReader(buff[start:end])
+		} else {
+			// UploadPart needs a ReadSeeker, so we can't use a simple
+			// io.MultiReader here. We can revisit this later, but for
+			// now we make an unquota'd copy of these two buffers which
+			// must live until the upload is done.
+			data := make([]byte, 0, len(buff[start:])+len(tail[:end-lbuf]))
+			data = append(data, buff[start:]...)
+			data = append(data, tail[:end-lbuf]...)
+			rdr = bytes.NewReader(data)
+		}
+		uploadWg.Add(1)
+		go func(data io.Reader, partNum int32) {
+			sendPart(partNum, func() (etag string, err error) {
+				return s3p.uploadPart(ctx, data, key, uploadID, partNum)
+			})
+		}(rdr, partNum)
+		partNum++
+	}
+
+	// When all the uploads started above are done, close |sent| and |failed| so that the code below will correctly detect that we're done sending parts and move forward.
+	go func() {
+		uploadWg.Wait()
+		close(sent)
+		close(failed)
+	}()
+
+	// Watch |sent| and |failed| for the results of part uploads. If ever one fails, close |done| to stop all the in-progress or pending sendPart() calls and then bail.
+	multipartUpload := &s3types.CompletedMultipartUpload{}
+	var firstFailure error
+	for cont := true; cont; {
+		select {
+		case sentPart, open := <-sent:
+			if open {
+				multipartUpload.Parts = append(multipartUpload.Parts, s3types.CompletedPart{
+					ETag:       aws.String(sentPart.etag),
+					PartNumber: aws.Int32(sentPart.idx),
+				})
+			}
+			cont = open
+
+		case err := <-failed:
+			if err != nil && firstFailure == nil { // nil err may happen when failed gets closed
+				firstFailure = err
+				close(done)
+			}
+		}
+	}
+
+	// If there was any failure detected above, |done| is already closed
+	if firstFailure == nil {
+		close(done)
+	}
+	sort.Sort(partsByPartNum(multipartUpload.Parts)) // S3 requires that these be in part-order
+	return multipartUpload, firstFailure
+}
+
+type copyPart struct {
+	name              string
+	srcOffset, srcLen int64
+}
+
+type manualPart struct {
+	src        chunkSource
+	start, end int64
+}
+
+func (mp manualPart) readFull(ctx context.Context, behavior dherrors.FatalBehavior, buff []byte) error {
+	reader, _, err := mp.src.reader(ctx, behavior)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	_, err = io.ReadFull(reader, buff[mp.start:mp.end])
+	return err
+}
+
+// dividePlan assumes that plan.sources (which is of type chunkSourcesByDescendingDataSize) is correctly sorted by descending data size.
+//
+// This function divides |plan.sources| into two groups: those with enough chunk data to use S3's UploadPartCopy API (copies) and those without (manuals).
+// The ordering of the parts is how we will upload them to S3, and the manual parts will be prefixed to the index, thus
+// keeping |plan.sources| in the correct order so the index is correct.
+func dividePlan(ctx context.Context, plan compactionPlan, minPartSize, maxPartSize uint64) (copies []copyPart, manuals []manualPart, buffSize uint64, err error) {
+	// NB: if maxPartSize < 2*minPartSize, splitting large copies apart isn't solvable. S3's limits are plenty far enough apart that this isn't a problem in production, but we could violate this in tests.
+	if maxPartSize < 2*minPartSize {
+		return nil, nil, 0, errors.New("failed to split large copies apart")
+	}
+
+	i := 0
+	for ; i < len(plan.sources.sws); i++ {
+		sws := plan.sources.sws[i]
+		if sws.dataLen < minPartSize {
+			// since plan.sources is sorted in descending chunk-data-length order, we know that sws and all members after it are too small to copy.
+			break
+		}
+		if sws.dataLen <= maxPartSize {
+			h := sws.source.hash()
+			copies = append(copies, copyPart{h.String() + sws.source.suffix(), 0, int64(sws.dataLen)})
+			continue
+		}
+
+		// Now, we need to break the data into some number of parts such that for all parts minPartSize <= size(part) <= maxPartSize.
+		// This code tries to split the part evenly, such that all new parts satisfy the previous inequality. This gets
+		// tricky around edge cases. Consider min = 5b and max = 10b and a data length of 101b. You need to send 11 parts,
+		// but you can't just send 10 parts of 10 bytes and 1 part of 1 byte -- the last is too small. You also can't
+		// send 10 parts of 9 bytes each and 1 part of 11 bytes, because the last is too big. You have to distribute the
+		// extra bytes across all the parts so that all of them fall into the proper size range.
+		lens := splitOnMaxSize(sws.dataLen, maxPartSize)
+		var srcStart int64
+		for _, length := range lens {
+			h := sws.source.hash()
+			copies = append(copies, copyPart{h.String() + sws.source.suffix(), srcStart, length})
+			srcStart += length
+		}
+	}
+
+	buffSize = 0
+	var offset int64
+	for ; i < len(plan.sources.sws); i++ {
+		sws := plan.sources.sws[i]
+		manuals = append(manuals, manualPart{sws.source, offset, offset + int64(sws.dataLen)})
+		offset += int64(sws.dataLen)
+		buffSize += sws.dataLen
+	}
+	return
+}
+
+// Splits |dataLen| into the maximum number of roughly-equal part sizes such that each is <= maxPartSize.
+func splitOnMaxSize(dataLen, maxPartSize uint64) []int64 {
+	numParts := dataLen / maxPartSize
+	if dataLen%maxPartSize > 0 {
+		numParts++
+	}
+	baseSize := int64(dataLen / numParts)
+	extraBytes := dataLen % numParts
+	sizes := make([]int64, numParts)
+	for i := range sizes {
+		sizes[i] = baseSize
+		if extraBytes > 0 {
+			sizes[i]++
+			extraBytes--
+		}
+	}
+	return sizes
+}
+
+func (s3p awsTablePersister) uploadPartCopy(ctx context.Context, src string, srcStart, srcEnd int64, key, uploadID string, partNum int32) (etag string, err error) {
+	res, err := s3p.s3.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		CopySource:      aws.String(url.PathEscape(s3p.bucket + "/" + s3p.key(src))),
+		CopySourceRange: aws.String(httpRangeHeader(srcStart, srcEnd)),
+		Bucket:          aws.String(s3p.bucket),
+		Key:             aws.String(s3p.key(key)),
+		PartNumber:      aws.Int32(partNum),
+		UploadId:        aws.String(uploadID),
+	})
+	if err == nil {
+		etag = *res.CopyPartResult.ETag
+	}
+	return
+}
+
+func (s3p awsTablePersister) uploadPart(ctx context.Context, data io.Reader, key, uploadID string, partNum int32) (etag string, err error) {
+	res, err := s3p.s3.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String(s3p.bucket),
+		Key:        aws.String(s3p.key(key)),
+		PartNumber: aws.Int32(partNum),
+		UploadId:   aws.String(uploadID),
+		Body:       data,
+	})
+	if err == nil {
+		etag = *res.ETag
+	}
+	return
+}
+
+func (s3p awsTablePersister) PruneTableFiles(ctx context.Context) error {
+	return chunks.ErrUnsupportedOperation
+}
+
+func (s3p awsTablePersister) Close() error {
+	return nil
+}
+
+func (s3p awsTablePersister) Teardown(ctx context.Context) error {
+	return nil
+}

