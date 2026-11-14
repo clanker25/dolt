@@ -1,0 +1,514 @@
+// Copyright 2019 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package dolt.services.remotesapi.v1alpha1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1;remotesapi";
+
+service ChunkStoreService {
+  rpc GetRepoMetadata(GetRepoMetadataRequest) returns (GetRepoMetadataResponse);
+
+  rpc HasChunks(HasChunksRequest) returns (HasChunksResponse);
+
+  // Get the download locations for a list of chunk hashes.
+  // Deprecated. Use StreamDownloadLocations.
+  rpc GetDownloadLocations(GetDownloadLocsRequest) returns (GetDownloadLocsResponse);
+
+  // Get the download locations for a list of chunk hashes. Streaming to
+  // support large and incrementally available payloads. Results are generated
+  // as requests come in.
+  //
+  // Deprecated: prefer StreamChunkLocations, which deduplicates
+  // table-file metadata across the stream. Kept on the wire
+  // indefinitely so old clients continue to work.
+  rpc StreamDownloadLocations(stream GetDownloadLocsRequest) returns (stream GetDownloadLocsResponse);
+
+  // Get the download locations for a list of chunk hashes. Streaming
+  // variant that deduplicates table-file metadata across the stream.
+  // Preferred over StreamDownloadLocations when the server advertises
+  // FEATURE_STREAM_CHUNK_LOCATIONS in GetRepoMetadataResponse.features.
+  rpc StreamChunkLocations(stream StreamChunkLocationsRequest) returns (stream StreamChunkLocationsResponse);
+
+  // Get upload locations for a list of table file hashes.
+  // NOTE: We upload full table files but download individual chunks.
+  rpc GetUploadLocations(GetUploadLocsRequest) returns (GetUploadLocsResponse);
+
+  rpc Rebase(RebaseRequest) returns (RebaseResponse);
+
+  rpc Root(RootRequest) returns (RootResponse);
+
+  rpc Commit(CommitRequest) returns (CommitResponse);
+
+  rpc ListTableFiles(ListTableFilesRequest) returns (ListTableFilesResponse);
+
+  rpc RefreshTableFileUrl(RefreshTableFileUrlRequest) returns (RefreshTableFileUrlResponse);
+
+  rpc AddTableFiles(AddTableFilesRequest) returns (AddTableFilesResponse);
+}
+
+// RepoId is how repositories are represented on dolthub, for example
+// `dolthub/us-housing-prices-v2` has org = dolthub, repo_name =
+// us-housing-prices-v2.
+//
+// All methods of ChunkStoreService targeting a repository take a RepoId. Many
+// will also take a `repo_token`, which can be provided in addition to a
+// RepoId. `repo_token`s can be returned from repository-accessing RPCs on
+// ChunkStoreService, and providing them instead of RepoId for future calls to
+// ChunkStoreService can be more efficient than providing RepoId itself.
+// `repo_token`s are fully opaque to the client.
+message RepoId {
+  string org = 1;
+  string repo_name = 2;
+}
+
+message HasChunksRequest {
+  RepoId repo_id = 1;
+  repeated bytes hashes = 2;
+
+  string repo_token = 3;
+  string repo_path = 4;
+}
+
+message HasChunksResponse {
+  repeated int32 absent = 1;
+
+  string repo_token = 2;
+}
+
+message HttpGetChunk {
+  string url = 1;
+  repeated bytes hashes = 2;
+}
+
+message RangeChunk {
+  bytes hash = 1;
+  uint64 offset = 2;
+  uint32 length = 3;
+
+  // Archive zStd dictionary spans are indicated with these fields. On the consumer side, the existence
+  // of a non-zero dictionary length indicates that the chunk is compressed using zStd. This implies that
+  // the chunkSource is an archive source. If the dictionary length is zero, the chunk is compressed using snappy
+  // compression (classic NOMS table file or journal chunk use snappy compression).
+  uint64 dictionary_offset = 4;
+  uint32 dictionary_length = 5;
+}
+
+message HttpGetRange {
+  string url = 1;
+  repeated RangeChunk ranges = 2;
+}
+
+message DownloadLoc {
+  oneof location {
+    HttpGetChunk http_get = 1;
+    HttpGetRange http_get_range = 2;
+  }
+  google.protobuf.Timestamp refresh_after = 3;
+  RefreshTableFileUrlRequest refresh_request = 4;
+}
+
+message HttpPostTableFile {
+  string url = 1;
+}
+
+message UploadLoc {
+  bytes table_file_hash = 1;
+  oneof location {
+    HttpPostTableFile http_post = 2;
+  }
+}
+
+message GetDownloadLocsRequest {
+  RepoId repo_id = 1;
+  repeated bytes chunk_hashes = 2;
+
+  string repo_token = 3;
+  string repo_path = 4;
+
+  // Capabilities the calling client declares about itself. See the
+  // ClientCapability enum. Populated by the client on every outbound
+  // request; absent means "not capable."
+  repeated ClientCapability client_capabilities = 5;
+}
+
+message GetDownloadLocsResponse {
+  repeated DownloadLoc locs = 1;
+
+  string repo_token = 2;
+}
+
+message StreamChunkLocationsRequest {
+  // Every request must populate RepoId/repo_token/repo_path on the
+  // wire. This matches what the current StreamDownloadLocations
+  // client already does and is load-bearing for retry correctness:
+  // the reliable-RPC layer may tear down the underlying gRPC stream
+  // and replay any unacked requests against a freshly opened stream,
+  // so the server must never need prior in-stream state to interpret
+  // a request.
+  RepoId repo_id = 1;
+  string repo_token = 2;
+  string repo_path = 3;
+
+  // Flat, packed buffer of 20-byte chunk hashes: hash N occupies
+  // bytes [N*20 : (N+1)*20]. Not a |repeated bytes| because every
+  // element is exactly 20 bytes and the 2-byte per-element
+  // tag/length overhead of |repeated bytes| is ~10% of the whole
+  // request in a 512-hash batch. Servers MUST reject requests
+  // where len(chunk_hashes) is not a multiple of 20.
+  bytes chunk_hashes = 4;
+
+  // Stream-scoped. The client's capability set does not change
+  // within a single server-side stream. Today every request on
+  // the stream MUST carry the full set (same rule as
+  // repo_id/token/path above); the reliable-RPC layer relies on
+  // this for replay correctness. A future protocol revision may
+  // allow omitting it after the first message; servers MUST
+  // continue to accept it on every message.
+  repeated ClientCapability client_capabilities = 5;
+}
+
+message StreamChunkLocationsResponse {
+  // TableFileRecord and ChunkLocation are nested inside the response
+  // rather than free-standing at package level. Their invariants
+  // (table_file_id is stream-scoped; request_index is scoped to one
+  // request's chunk_hashes) only hold in the context of this
+  // response.
+  message TableFileRecord {
+    // Opaque id assigned by the server, scoped to the current
+    // server-side stream. The server MUST emit a TableFileRecord
+    // for any id on its first use within a given server-side
+    // stream, before (or in the same response as) any
+    // ChunkLocation that references the id. Clients MUST overwrite
+    // any prior entry for the same id when a new TableFileRecord
+    // arrives.
+    uint32 table_file_id = 1;
+
+    // Signed URL the client should issue byte-range requests
+    // against.
+    string url = 2;
+
+    // When the client should consider |url| stale and call
+    // RefreshTableFileUrl.
+    google.protobuf.Timestamp refresh_after = 3;
+
+    // The file_id to use when calling RefreshTableFileUrl. All the
+    // other fields of RefreshTableFileUrlRequest (repo_id,
+    // repo_token, repo_path) are already known to the client.
+    string file_id = 4;
+  }
+
+  message ChunkLocation {
+    // Refers to a TableFileRecord.table_file_id introduced in the
+    // current server-side stream -- either in an earlier response
+    // message on this same stream, or in the same response message
+    // as this ChunkLocation.
+    uint32 table_file_id = 1;
+
+    // Hash index into the corresponding request's chunk_hashes
+    // buffer: a value of N refers to the N'th 20-byte hash, i.e.
+    // bytes [N*20 : (N+1)*20]. Not a byte offset. Avoids
+    // re-transmitting the 20-byte hash on the wire.
+    uint32 request_index = 2;
+
+    uint64 offset = 3;
+    uint32 length = 4;
+
+    // zStd dictionary span within the same table file. Same
+    // semantics as the existing RangeChunk.dictionary_{offset,length}.
+    uint64 dictionary_offset = 5;
+    uint32 dictionary_length = 6;
+  }
+
+  // If non-empty, advertises a new repo_token that the client should
+  // use on future requests on this service.
+  string repo_token = 1;
+
+  // Zero or more table-file records introduced by this response.
+  // Valid for the remainder of this server-side stream. Clients MUST
+  // integrate these into their table_file_id map (inserting or
+  // overwriting) before resolving any |locations| in this same
+  // response.
+  repeated TableFileRecord table_files = 2;
+
+  // Chunk locations for the hashes in the corresponding request.
+  // Response ordering is 1:1 with requests.
+  repeated ChunkLocation locations = 3;
+
+  // Hash indices into the corresponding request's chunk_hashes
+  // buffer that the server could not find: a value of N here means
+  // the N'th 20-byte hash (bytes [N*20 : (N+1)*20]) was not found.
+  // Not a byte offset. Sent explicitly so the client does not have
+  // to diff requested vs. returned.
+  repeated uint32 missing_indexes = 4;
+}
+
+message TableFileDetails {
+  bytes id = 1;
+  uint64 content_length = 2;
+  bytes content_hash = 3;
+  uint64 num_chunks = 4;
+  string suffix = 5;
+  uint64 split_offset = 6;
+}
+
+message GetUploadLocsRequest {
+  RepoId repo_id = 1;
+  repeated bytes table_file_hashes = 2 [deprecated = true];
+  repeated TableFileDetails table_file_details = 3;
+
+  string repo_token = 4;
+  string repo_path = 5;
+}
+
+message GetUploadLocsResponse {
+  repeated UploadLoc locs = 1;
+
+  string repo_token = 2;
+}
+
+message RebaseRequest {
+  RepoId repo_id = 1;
+  string repo_token = 2;
+  string repo_path = 3;
+}
+
+message RebaseResponse {
+  string repo_token = 1;
+}
+
+message RootRequest {
+  RepoId repo_id = 1;
+
+  string repo_token = 2;
+  string repo_path = 3;
+}
+
+message RootResponse {
+  bytes root_hash = 1;
+
+  string repo_token = 2;
+}
+
+message ChunkTableInfo {
+  bytes hash = 1;
+  uint32 chunk_count = 2;
+}
+
+message CommitRequest {
+  RepoId repo_id = 1;
+  bytes current = 2;
+  bytes last = 3;
+  repeated ChunkTableInfo chunk_table_info = 4;
+  ClientRepoFormat client_repo_format = 14;
+  string repo_path = 5;
+}
+
+message CommitResponse {
+  bool success = 1;
+}
+
+message GetRepoMetadataRequest {
+  RepoId repo_id = 1;
+  ClientRepoFormat client_repo_format = 14;
+
+  string repo_token = 2;
+  string repo_path = 3;
+}
+
+// A ChunkStore can request a client to implement a specific concurrency
+// control mechanism when updating a branch HEAD.
+//
+// This exists because passive remotes, like DoltHub, typically do not have
+// meaningful workingSets. When a client requests to push a branch HEAD to a
+// DoltHub remote, they have no visibility into the workingSet/ value for the
+// corresponding branch. It has historically been the case that clients ignore
+// it and just push the branch HEAD.
+//
+// On the other hand, when pushing to a running sql-server, not stomping
+// concurrent transaction is important, and the remote endpoint will want the
+// pushing client to ensure that it both checks that the branch's working set
+// is clean and that it updates the branch's working set appropriately if the
+// push is successful.
+//
+// Servers advertise which concurrency control mechanism they want in their
+// GetRepoMetadataResponse.
+enum PushConcurrencyControl {
+  PUSH_CONCURRENCY_CONTROL_UNSPECIFIED = 0;
+  PUSH_CONCURRENCY_CONTROL_IGNORE_WORKING_SET = 1;
+  PUSH_CONCURRENCY_CONTROL_ASSERT_WORKING_SET = 2;
+}
+
+// Optional, additive capability flags advertised by the server in
+// GetRepoMetadataResponse.features. Use this for pure "does the
+// server implement X?" booleans. Mode selectors with more than two
+// states (such as the existing PushConcurrencyControl) keep their
+// own typed fields; this list is only for flag-shaped capabilities.
+//
+// Guidelines for growth:
+// - Add new values at the end; never reuse a removed value's
+//   number. If a feature is retired, reserve its number rather
+//   than re-purposing it.
+// - FEATURE_UNSPECIFIED = 0 is never sent; presence of the zero
+//   value in a received list should be ignored by the client.
+enum Feature {
+  FEATURE_UNSPECIFIED = 0;
+
+  // Server implements the StreamChunkLocations RPC. Clients should
+  // prefer it to StreamDownloadLocations when this feature is
+  // present.
+  FEATURE_STREAM_CHUNK_LOCATIONS = 1;
+}
+
+// Capabilities the client declares about itself on every request
+// that the server may use to select alternative URL endpoints,
+// wire encodings, or response shapes. Missing value => not capable.
+// Servers SHOULD continue to serve clients that send no
+// capabilities; capability-gated behaviors are intended as
+// optional upgrades, not correctness boundaries.
+//
+// Populated by the client at send time. Servers that construct
+// prebuilt RefreshTableFileUrlRequest messages for echo-style
+// responses (see ListTableFiles, GetDownloadLocations) SHOULD
+// leave this field unset; the sending client overwrites it.
+//
+// Guidelines for growth:
+// - Add new values at the end; never reuse a removed value's
+//   number. Reserve retired numbers rather than repurposing them.
+// - CLIENT_CAPABILITY_UNSPECIFIED = 0 is never sent; presence of
+//   the zero value in a received list should be ignored.
+enum ClientCapability {
+  CLIENT_CAPABILITY_UNSPECIFIED = 0;
+
+  // The client's HTTP fetcher correctly handles HTTP/2 response
+  // bodies for chunk and table-file downloads. Servers MAY return
+  // signed URLs that resolve to HTTP/2 endpoints (e.g. CDN-fronted
+  // hosts) when this is set. When this is not set, servers SHOULD
+  // prefer URLs that resolve to HTTP/1.1 endpoints if such a
+  // choice is available. Servers without a separate HTTP/1.1
+  // option may return whatever URL they have; old clients
+  // generally succeed against HTTP/2 URLs but can see degraded
+  // performance under certain network conditions.
+  CLIENT_CAPABILITY_HTTP2_DOWNLOAD = 1;
+}
+
+message GetRepoMetadataResponse {
+  // Version string of the noms binary format for this repository.
+  // See types.NomsBinFormat.
+  string nbf_version = 1;
+  // Version string of the nbs format of this repository.
+  // See nbs.StorageVersion.
+  string nbs_version = 2;
+  // Approximate number of bytes required for storage of all
+  // currently-referenced repository table files.
+  uint64 storage_size = 3;
+
+  string repo_token = 4;
+
+  PushConcurrencyControl push_concurrency_control = 5;
+
+  // Optional capability flags advertised by the server. See the
+  // Feature enum above. Order is not significant; duplicates
+  // should be treated the same as a single occurrence.
+  repeated Feature features = 6;
+}
+
+message ClientRepoFormat {
+  string nbf_version = 1;
+  string nbs_version = 2;
+}
+
+message ListTableFilesRequest  {
+  RepoId repo_id = 1;
+  bool appendix_only = 2 [deprecated = true];
+
+  string repo_token = 3;
+  string repo_path = 4;
+
+  // Capabilities the calling client declares about itself. See the
+  // ClientCapability enum. Populated by the client on every outbound
+  // request; absent means "not capable."
+  repeated ClientCapability client_capabilities = 5;
+}
+
+message TableFileInfo {
+  string file_id = 1;
+  uint32 num_chunks = 2;
+  string url = 3;
+  google.protobuf.Timestamp refresh_after = 4;
+  RefreshTableFileUrlRequest refresh_request = 5;
+  uint64 split_offset = 6;
+}
+
+message RefreshTableFileUrlRequest {
+  RepoId repo_id = 1;
+  string file_id = 2;
+
+  string repo_token = 3;
+  string repo_path = 4;
+
+  // Capabilities the calling client declares about itself. See the
+  // ClientCapability enum. The client stamps this field at send
+  // time on every outbound request, including when it is sending
+  // a RefreshTableFileUrlRequest that the server previously
+  // prebuilt and embedded in a response (see TableFileInfo and
+  // DownloadLoc). Servers constructing prebuilt refresh requests
+  // SHOULD leave this field unset; the client overwrites it.
+  repeated ClientCapability client_capabilities = 5;
+}
+
+message RefreshTableFileUrlResponse {
+  string url = 1;
+  google.protobuf.Timestamp refresh_after = 2;
+
+  string repo_token = 3;
+}
+
+message ListTableFilesResponse {
+  bytes root_hash = 1;
+  repeated TableFileInfo table_file_info = 2;
+  repeated TableFileInfo appendix_table_file_info = 3;
+
+  string repo_token = 4;
+}
+
+enum ManifestAppendixOption {
+  MANIFEST_APPENDIX_OPTION_UNSPECIFIED = 0;
+  MANIFEST_APPENDIX_OPTION_SET = 1;
+  MANIFEST_APPENDIX_OPTION_APPEND = 2;
+}
+
+message AddTableFilesRequest {
+  RepoId repo_id = 1;
+  ClientRepoFormat client_repo_format = 2;
+  repeated ChunkTableInfo chunk_table_info = 3;
+  // If set, this is a write for the manifest appendix, not just the manifest table file specs.
+  // The table files appearing in `chunk_table_info` are added to `specs` and are also set
+  // in the manifest appendix. If `appendix_option` is `SET`, then the value of the appendix
+  // becomes the full list provided in `chunk_table_info` and any prior specs in the appendix
+  // are removed from the manifest specs. If `append_option` is `APPEND`, then the
+  // supplied table files are added to the appendix and to specs.
+  ManifestAppendixOption appendix_option = 4;
+
+  string repo_token = 5;
+  string repo_path = 6;
+}
+
+message AddTableFilesResponse {
+  bool success = 1;
+  string repo_token = 2;
+}

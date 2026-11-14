@@ -1,0 +1,171 @@
+// Copyright 2019 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package commands
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"syscall"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/utils/osutil"
+	"github.com/dolthub/dolt/go/store/types"
+	"github.com/dolthub/dolt/go/store/util/outputpager"
+)
+
+func TestLog(t *testing.T) {
+	ctx := context.Background()
+	dEnv := createUninitializedEnv()
+	err := dEnv.InitRepo(ctx, types.Format_DOLT, "Bill Billerson", "bigbillieb@fake.horse", env.DefaultInitBranch)
+	defer dEnv.Close()
+
+	if err != nil {
+		t.Error("Failed to init repo")
+	}
+
+	cs, _ := doltdb.NewCommitSpec(env.DefaultInitBranch)
+	opt, _ := dEnv.DoltDB(ctx).Resolve(context.Background(), cs, nil)
+	commit, _ := opt.ToCommit()
+
+	meta, _ := commit.GetCommitMeta(context.Background())
+	require.Equal(t, "Bill Billerson", meta.Author.Name)
+}
+
+func TestLogSigterm(t *testing.T) {
+	if osutil.IsWindows {
+		t.Skip("Skipping test as function used is not supported on Windows")
+	}
+
+	ctx := context.Background()
+	dEnv := createUninitializedEnv()
+	err := dEnv.InitRepo(ctx, types.Format_DOLT, "Bill Billerson", "bigbillieb@fake.horse", env.DefaultInitBranch)
+	defer dEnv.Close()
+
+	if err != nil {
+		t.Error("Failed to init repo")
+	}
+
+	cs, _ := doltdb.NewCommitSpec(env.DefaultInitBranch)
+	optCmt, _ := dEnv.DoltDB(ctx).Resolve(context.Background(), cs, nil)
+	commit, _ := optCmt.ToCommit()
+	cMeta, _ := commit.GetCommitMeta(context.Background())
+	cHash, _ := commit.HashOf()
+
+	outputpager.SetTestingArg(true)
+	defer outputpager.SetTestingArg(false)
+
+	pager := outputpager.Start()
+	defer pager.Stop()
+
+	chStr := cHash.String()
+
+	for i := 0; i < 5; i++ {
+		pager.Writer.Write([]byte(fmt.Sprintf("\033[1;33mcommit %s \033[0m", chStr)))
+		pager.Writer.Write([]byte(fmt.Sprintf("\nAuthor: %s <%s>", cMeta.Author.Name, cMeta.Author.Email)))
+
+		timeStr := cMeta.FormatTS()
+		pager.Writer.Write([]byte(fmt.Sprintf("\nDate:  %s", timeStr)))
+
+		formattedDesc := "\n\n\t" + strings.Replace(cMeta.Description, "\n", "\n\t", -1) + "\n\n"
+		pager.Writer.Write([]byte(formattedDesc))
+	}
+
+	process, err := os.FindProcess(syscall.Getpid())
+	require.NoError(t, err)
+
+	err = process.Signal(syscall.SIGTERM)
+	require.NoError(t, err)
+}
+
+func TestDoltPagerEnvironmentVariable(t *testing.T) {
+	// Test that DOLT_PAGER environment variable is respected
+	originalPager := os.Getenv("DOLT_PAGER")
+	defer func() {
+		if originalPager == "" {
+			os.Unsetenv("DOLT_PAGER")
+		} else {
+			os.Setenv("DOLT_PAGER", originalPager)
+		}
+	}()
+
+	// Set DOLT_PAGER to head -n 2 for testing
+	err := os.Setenv("DOLT_PAGER", "head -n 2")
+	require.NoError(t, err)
+
+	// Enable testing mode to bypass TTY check
+	outputpager.SetTestingArg(true)
+	defer outputpager.SetTestingArg(false)
+
+	// Start the pager - it should use head -n 2 from DOLT_PAGER
+	pager := outputpager.Start()
+	defer pager.Stop()
+
+	// Write multiple lines to test that head -n 2 truncates output
+	testLines := []string{
+		"line 1\n",
+		"line 2\n",
+		"line 3\n",
+		"line 4\n",
+		"line 5\n",
+	}
+
+	for _, line := range testLines {
+		pager.Writer.Write([]byte(line))
+	}
+
+	// The test passes if the pager was created successfully with DOLT_PAGER
+	// We can't easily test the actual truncation in a unit test since the pager
+	// runs as a separate process, but we verify that the pager starts without error
+	// when DOLT_PAGER is set to a valid command
+	require.NotNil(t, pager)
+	require.NotNil(t, pager.Writer)
+}
+
+func TestDoltPagerFallback(t *testing.T) {
+	// Test that when DOLT_PAGER is empty, it falls back to less/more
+	originalPager := os.Getenv("DOLT_PAGER")
+	defer func() {
+		if originalPager == "" {
+			os.Unsetenv("DOLT_PAGER")
+		} else {
+			os.Setenv("DOLT_PAGER", originalPager)
+		}
+	}()
+
+	// Unset DOLT_PAGER to test fallback
+	os.Unsetenv("DOLT_PAGER")
+
+	// Enable testing mode to bypass TTY check
+	outputpager.SetTestingArg(true)
+	defer outputpager.SetTestingArg(false)
+
+	// Start the pager - it should fall back to less or more
+	pager := outputpager.Start()
+	defer pager.Stop()
+
+	// Write some test content
+	pager.Writer.Write([]byte("test line 1\n"))
+	pager.Writer.Write([]byte("test line 2\n"))
+
+	// The test passes if the pager was created successfully with fallback
+	require.NotNil(t, pager)
+	require.NotNil(t, pager.Writer)
+}

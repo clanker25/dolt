@@ -1,0 +1,156 @@
+#!/usr/bin/env bats
+load $BATS_TEST_DIRNAME/helper/common.bash
+
+make_repo() {
+    mkdir $1
+    cd $1
+    echo $PWD
+    dolt init
+    cd ..
+}
+
+setup() {
+    setup_no_dolt_init
+    make_repo repo1
+    make_repo repo2
+}
+
+teardown() {
+    teardown_common
+}
+
+seed_repos_with_tables_with_use_statements() {
+    dolt --data-dir ./ sql -r csv -b -q "
+            USE repo1;
+            CREATE TABLE r1_t1 (pk BIGINT, PRIMARY KEY(pk));
+            INSERT INTO r1_t1 (pk) values (0),(1),(2);
+            USE repo2;
+            CREATE TABLE r2_t1 (pk BIGINT, c1 BIGINT, PRIMARY KEY(pk));
+            INSERT INTO r2_t1 (pk, c1) values (2,200),(3,300),(4,400);"
+}
+
+@test "sql-multi-db: sql multi-db test show databases" {
+    EXPECTED=$(echo -e "Database\ninformation_schema\nmysql\nrepo1\nrepo2")
+    run dolt --data-dir ./ sql -r csv -q "SHOW DATABASES"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$EXPECTED" ]] || false
+}
+
+@test "sql-multi-db: dolt sql ignores an in-progress database directory" {
+    touch repo2/.dolt_safe_to_ignore
+
+    run dolt --data-dir ./ sql -r csv -q "SHOW DATABASES"
+    [ "$status" -eq 0 ]
+    # Match database rows exactly: the skip warning line also mentions repo2's path.
+    echo "$output" | grep -qx "repo1" || false
+    ! ( echo "$output" | grep -qx "repo2" ) || false
+
+    run dolt --data-dir ./ sql -r csv -q "SELECT COUNT(*) FROM information_schema.schemata"
+    [ "$status" -eq 0 ]
+    # information_schema and repo1: the ignored repo2 is not counted.
+    echo "$output" | grep -qx "2" || false
+
+    [ -d repo2 ]
+}
+
+@test "sql-multi-db: sql use statement and table accessibility" {
+    seed_repos_with_tables_with_use_statements
+
+    EXPECTED_R1T1=$(echo -e "pk\n0\n1\n2")
+    run dolt --data-dir ./ sql -r csv -b -q "USE repo1; SELECT * FROM r1_t1;"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$EXPECTED_R1T1" ]] || false
+
+    EXPECTED_R2T1=$(echo -e "pk,c1\n2,200\n3,300\n4,400")
+    run dolt --data-dir ./ sql -r csv -b -q "USE repo2; SELECT * FROM r2_t1;"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$EXPECTED_R2T1" ]] || false
+
+    # test tables of other database inaccessible without database qualifier
+    run dolt --data-dir ./ sql -r csv -b -q "USE repo1; SELECT * FROM r2_t1;"
+    [ ! "$status" -eq 0 ]
+    run dolt --data-dir ./ sql -r csv -b -q "USE repo2; SELECT * FROM r1_t1;"
+    [ ! "$status" -eq 0 ]
+
+    # test tables in other databases accessible when qualified
+    run dolt --data-dir ./ sql -r csv -b -q "USE repo1; SELECT * FROM repo2.r2_t1;"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$EXPECTED_R2T1" ]] || false
+    run dolt --data-dir ./ sql -r csv -b -q "USE repo2; SELECT * FROM repo1.r1_t1;"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$EXPECTED_R1T1" ]] || false
+}
+
+@test "sql-multi-db: sql test use invalid db name" {
+    seed_repos_with_tables_with_use_statements
+
+    run dolt --data-dir ./ sql -r csv -q "USE invalid_db_name;"
+    [ ! "$status" -eq 0 ]
+    echo $output
+    [[ "$output" =~ "database not found: invalid_db_name" ]] || false
+}
+
+@test "sql-multi-db: sql join tables in different databases" {
+    seed_repos_with_tables_with_use_statements
+
+    EXPECTED=$(echo -e "pk,c1\n2,200")
+    run dolt --data-dir ./ sql -r csv -b -q "
+        USE repo1;
+        SELECT r1_t1.pk as pk, repo2.r2_t1.c1 as c1 FROM r1_t1 JOIN repo2.r2_t1 ON r1_t1.pk=repo2.r2_t1.pk;"
+    echo \"\"\"$output\"\"\"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$EXPECTED" ]] || false
+}
+
+@test "sql-multi-db: join on multiple databases with same name" {
+    seed_repos_with_tables_with_use_statements
+    dolt --data-dir ./ sql -b -q "
+            USE repo1;
+            CREATE TABLE r2_t1 (pk BIGINT, c1 BIGINT, PRIMARY KEY(pk));
+            INSERT INTO r2_t1 (pk, c1) values (2,200),(3,300),(4,400);"
+    run dolt --data-dir ./ sql -q "select * from repo1.r2_t1 join repo2.r2_t1 on repo1.r2_t1.pk=repo2.r2_t1.pk"
+    [ "$status" -eq 0 ]
+    [[ ! $output =~ "Not unique table/alias" ]] || false
+}
+
+@test "sql-multi-db: fetch multiple databases with appropriate tempdir" {
+    seed_repos_with_tables_with_use_statements
+    mkdir remote1
+    mkdir -p subremotes/repo1
+    cd subremotes/repo1
+    dolt init
+    dolt remote add origin file://../../remote1
+    dolt push origin main
+    cd ..
+    dolt clone file://../remote1 repo2
+
+    cd ..
+    dolt --data-dir ./subremotes sql -b -q "
+        USE repo2;
+        call dolt_fetch();" -r csv
+}
+
+@test "sql-multi-db: duplicate database directories are skipped with a warning and outer database is preserved" {
+    mkdir dupdb
+    (
+        cd dupdb
+        dolt init
+        dolt sql -q "CREATE TABLE outer_tbl (pk int primary key);"
+
+        mkdir dupdb
+        (
+            cd dupdb
+            dolt init
+            dolt sql -q "CREATE TABLE inner_tbl (pk int primary key);"
+        )
+
+        run dolt sql -r csv -q "SHOW DATABASES; SHOW TABLES;"
+        [ "$status" -eq 0 ]
+        [[ "$output" =~ "skipping duplicate database directory" ]] || false
+        [[ "$output" =~ "database=dupdb" ]] || false
+        [[ "$output" =~ "existing_database=dupdb" ]] || false
+
+        [[ "$output" =~ "outer_tbl" ]] || false
+        [[ ! "$output" =~ "inner_tbl" ]] || false
+    )
+}

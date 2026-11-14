@@ -1,0 +1,185 @@
+// Copyright 2022 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tree
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"math/rand"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dolthub/dolt/go/store/prolly/message"
+	"github.com/dolthub/dolt/go/store/val"
+)
+
+func init() {
+	benchData = make([][24]byte, 100_000)
+	buf := make([]byte, 24*100_000)
+	rand.Read(buf)
+	for i := range benchData {
+		start, stop := i*24, (i+1)*24
+		copy(benchData[i][:], buf[start:stop])
+	}
+}
+
+var benchData [][24]byte
+
+func BenchmarkRollingHashSplitter(b *testing.B) {
+	benchmarkNodeSplitter(b, newRollingHashSplitter(0))
+}
+
+func BenchmarkKeySplitter(b *testing.B) {
+	benchmarkNodeSplitter(b, newKeySplitter(0))
+}
+
+func benchmarkNodeSplitter(b *testing.B, split nodeSplitter) {
+	for i := 0; i < b.N; i++ {
+		j := i % len(benchData)
+		err := split.Append(benchData[j][:8], benchData[j][8:])
+		assert.NoError(b, err)
+		if split.CrossedBoundary() {
+			split.Reset()
+		}
+	}
+}
+
+func TestKeySplitterDistribution(t *testing.T) {
+	t.Skip("unskip for metrics")
+
+	factory := newKeySplitter
+	t.Run("plot node distribution for item Size 24", func(t *testing.T) {
+		scale := 1_000_000
+		nd, ns := makeProllyTreeWithSizes(t, factory, scale, 8, 16)
+		PrintTreeSummaryByLevel(t, nd, ns)
+		plotNodeSizeDistribution(t, "prolly_8_16.png", nd, ns)
+	})
+	t.Run("summarize node distribution for item sizes (8,54)", func(t *testing.T) {
+		for sz := 8; sz <= 54; sz++ {
+			fmt.Printf("Summary for map Size %d\n", sz)
+			nd, ns := makeProllyTreeWithSizes(t, factory, 100_000, sz, sz)
+			PrintTreeSummaryByLevel(t, nd, ns)
+			fmt.Println()
+		}
+	})
+	t.Run("plot node distribution for item sizes (8,54)", func(t *testing.T) {
+		var cumulative Samples
+		for sz := 8; sz <= 54; sz++ {
+			nd, ns := makeProllyTreeWithSizes(t, factory, 100_000, sz, sz)
+			data, err := measureTreeNodes(nd, ns)
+			require.NoError(t, err)
+			cumulative = append(cumulative, data...)
+		}
+		fmt.Println(cumulative.Summary())
+		plotIntHistogram("cumulative_node_sizes_8-54.png", cumulative)
+	})
+}
+
+func makeProllyTreeWithSizes(t *testing.T, fact splitterFactory, scale, keySz, valSz int) (nd *Node, ns NodeStore) {
+	pro := gaussianItems{
+		keyMean: float64(keySz),
+		keyStd:  float64(keySz) / 4,
+		valMean: float64(valSz),
+		valStd:  float64(valSz) / 4,
+		r:       testRand,
+	}
+
+	ctx := context.Background()
+	ns = NewTestNodeStore()
+	serializer := message.NewProllyMapSerializer(&val.TupleDesc{}, &val.TupleDesc{}, ns.Pool())
+	chunker, err := newEmptyChunker(ctx, ns, serializer)
+	require.NoError(t, err)
+
+	for i := 0; i < scale; i++ {
+		k, v := pro.Next()
+		_, err = chunker.append(ctx, k, v, 1)
+		require.NoError(t, err)
+	}
+
+	nd, err = chunker.Done(ctx)
+	require.NoError(t, err)
+	return
+}
+
+type itemProvider interface {
+	Next() (key, value Item)
+}
+
+type gaussianItems struct {
+	r       *rand.Rand
+	keyMean float64
+	keyStd  float64
+	valMean float64
+	valStd  float64
+}
+
+func (g gaussianItems) Next() (key, value Item) {
+	key = make(Item, g.sample(g.keyMean, g.keyStd))
+	value = make(Item, g.sample(g.valMean, g.valStd))
+	rand.Read(key)
+	rand.Read(value)
+	return
+}
+
+func (g gaussianItems) sample(mean, std float64) (s int) {
+	s = int(math.Round(g.r.NormFloat64()*std + mean))
+	if s < 0 {
+		s = 0
+	}
+	return
+}
+
+// alwaysSplitter ends a node after every item, which the chunker turns into
+// a binary tree, the shape long keys produce.
+type alwaysSplitter struct {
+	nodeSplitter
+}
+
+func (alwaysSplitter) CrossedBoundary() bool { return true }
+
+func TestChunkerTallTree(t *testing.T) {
+	defer func(f splitterFactory) { defaultSplitterFactory = f }(defaultSplitterFactory)
+	defaultSplitterFactory = func(level uint8) nodeSplitter {
+		return alwaysSplitter{newKeySplitter(level)}
+	}
+
+	ctx := context.Background()
+	ns := NewTestNodeStore()
+	chkr, err := newEmptyChunker(ctx, ns, message.NewProllyMapSerializer(keyDesc, valDesc, ns.Pool()))
+	require.NoError(t, err)
+
+	kb := val.NewTupleBuilder(keyDesc, ns)
+	vb := val.NewTupleBuilder(valDesc, ns)
+	// A binary tree of 2^15 leaves needs 16 levels.
+	const count = 1 << 15
+	items := make([][2]Item, count)
+	for i := 0; i < count; i++ {
+		kb.PutInt64(0, int64(i))
+		k, err := kb.Build(ctx, ns.Pool())
+		require.NoError(t, err)
+		vb.PutInt64(0, int64(i))
+		v, err := vb.Build(ctx, ns.Pool())
+		require.NoError(t, err)
+		items[i] = [2]Item{Item(k), Item(v)}
+		require.NoError(t, chkr.AddPair(ctx, Item(k), Item(v)))
+	}
+	root, err := chkr.Done(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 15, root.Level())
+	validateTreeItems(t, ns, root, items)
+}
