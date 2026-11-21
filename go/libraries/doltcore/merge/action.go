@@ -1,0 +1,206 @@
+// Copyright 2021 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package merge
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/dolthub/go-mysql-server/sql"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
+	"github.com/dolthub/dolt/go/store/datas"
+	"github.com/dolthub/dolt/go/store/hash"
+)
+
+var ErrFailedToDetermineMergeability = errors.New("failed to determine mergeability")
+
+type FastForwardMode int
+
+const (
+	FastForwardDefault FastForwardMode = iota
+	FastForwardOnly
+	NoFastForward
+)
+
+type MergeSpec struct {
+	HeadH           hash.Hash
+	MergeH          hash.Hash
+	HeadC           *doltdb.Commit
+	MergeC          *doltdb.Commit
+	MergeCSpecStr   string
+	StompedTblNames []doltdb.TableName
+	WorkingDiffs    map[doltdb.TableName]hash.Hash
+	Squash          bool
+	FFMode          FastForwardMode
+	NoCommit        bool
+	NoEdit          bool
+	Force           bool
+	Email           string
+	Name            string
+	Date            *datas.CommitDate
+}
+
+type MergeSpecOpt func(*MergeSpec)
+
+func WithFastForwardMode(mode FastForwardMode) MergeSpecOpt {
+	return func(ms *MergeSpec) {
+		ms.FFMode = mode
+	}
+}
+
+func WithNoCommit(noCommit bool) MergeSpecOpt {
+	return func(ms *MergeSpec) {
+		ms.NoCommit = noCommit
+	}
+}
+
+func WithNoEdit(noEdit bool) MergeSpecOpt {
+	return func(ms *MergeSpec) {
+		ms.NoEdit = noEdit
+	}
+}
+
+func WithForce(force bool) MergeSpecOpt {
+	return func(ms *MergeSpec) {
+		ms.Force = force
+	}
+}
+
+func WithSquash(squash bool) MergeSpecOpt {
+	return func(ms *MergeSpec) {
+		ms.Squash = squash
+	}
+}
+
+// NewMergeSpec returns a MergeSpec with the arguments provided. Pass |date| as nil when --date
+// was not explicitly specified; the merge commit will then derive the author date from the
+// dolt_author_date session variable.
+func NewMergeSpec[C doltdb.Context](
+	ctx C,
+	rsr env.RepoStateReader[C],
+	ddb *doltdb.DoltDB,
+	roots doltdb.Roots,
+	name, email, commitSpecStr string,
+	date *datas.CommitDate,
+	opts ...MergeSpecOpt,
+) (*MergeSpec, error) {
+	headCS, err := doltdb.NewCommitSpec("HEAD")
+	if err != nil {
+		return nil, err
+	}
+
+	headRef, err := rsr.CWBHeadRef(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	optCmt, err := ddb.Resolve(ctx, headCS, headRef)
+	if err != nil {
+		return nil, err
+	}
+	headCM, ok := optCmt.ToCommit()
+	if !ok {
+		// HEAD should always resolve to a commit, so this should never happen.
+		return nil, doltdb.ErrGhostCommitRuntimeFailure
+	}
+
+	mergeCS, err := doltdb.NewCommitSpec(commitSpecStr)
+	if err != nil {
+		return nil, err
+	}
+
+	optCmt, err = ddb.Resolve(ctx, mergeCS, headRef)
+	if err != nil {
+		return nil, err
+	}
+	mergeCM, ok := optCmt.ToCommit()
+	if !ok {
+		return nil, doltdb.ErrGhostCommitEncountered
+	}
+
+	headH, err := headCM.HashOf()
+	if err != nil {
+		return nil, err
+	}
+
+	mergeH, err := mergeCM.HashOf()
+	if err != nil {
+		return nil, err
+
+	}
+
+	stompedTblNames, workingDiffs, err := MergeWouldStompChanges(ctx, roots, mergeCM)
+	if err != nil {
+		return nil, fmt.Errorf("%w; %s", ErrFailedToDetermineMergeability, err.Error())
+	}
+
+	spec := &MergeSpec{
+		HeadH:           headH,
+		MergeH:          mergeH,
+		HeadC:           headCM,
+		MergeCSpecStr:   commitSpecStr,
+		MergeC:          mergeCM,
+		StompedTblNames: stompedTblNames,
+		WorkingDiffs:    workingDiffs,
+		Email:           email,
+		Name:            name,
+		Date:            date,
+	}
+
+	for _, opt := range opts {
+		opt(spec)
+	}
+
+	return spec, nil
+}
+
+// AbortMerge returns a new WorkingSet instance, with the active merge aborted, by clearing and
+// resetting the merge state in |workingSet| and using |roots| to identify the existing tables
+// and reset them, excluding any ignored tables. The caller must then set the new WorkingSet in
+// the session before the aborted merge is finalized. If no merge is in progress, this function
+// returns an error.
+func AbortMerge(ctx *sql.Context, workingSet *doltdb.WorkingSet, roots doltdb.Roots) (*doltdb.WorkingSet, error) {
+	if !workingSet.MergeActive() {
+		return nil, fmt.Errorf("there is no merge to abort")
+	}
+
+	preMergeWorkingRoot := workingSet.MergeState().PreMergeWorkingRoot()
+	preMergeWorkingTables, err := preMergeWorkingRoot.GetTableNames(ctx, doltdb.DefaultSchemaName, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Revert the working set back to the pre-merge working root
+	workingSet = workingSet.WithStagedRoot(roots.Head).WithWorkingRoot(preMergeWorkingRoot)
+	workingSet = workingSet.ClearMerge()
+
+	// Carry over any ignored tables (which could have been manually modified by a user while a merge was halted)
+	ignoredTables, err := doltdb.IdentifyIgnoredTables(ctx, roots, doltdb.ToTableNames(preMergeWorkingTables, doltdb.DefaultSchemaName))
+	if err != nil {
+		return nil, err
+	}
+	if len(ignoredTables) > 0 {
+		newWorking, err := actions.MoveTablesBetweenRoots(ctx, ignoredTables, roots.Working, preMergeWorkingRoot)
+		if err != nil {
+			return nil, err
+		}
+		workingSet = workingSet.WithWorkingRoot(newWorking)
+	}
+
+	return workingSet, nil
+}

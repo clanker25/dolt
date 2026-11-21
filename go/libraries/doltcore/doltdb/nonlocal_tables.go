@@ -1,0 +1,97 @@
+// Copyright 2025 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package doltdb
+
+import (
+	"context"
+	"fmt"
+	"io"
+
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
+	"github.com/dolthub/dolt/go/store/val"
+)
+
+// GetNonlocalTablesRef is a function that reads the "ref" column from dolt_nonlocal_tables. This is used to handle the Doltgres extended string type.
+var GetNonlocalTablesRef = getNonlocalTablesRef
+
+// GetNonlocalTablesNameColumn is a function that reads the "table_name" column from dolt_nonlocal_tables. This is used to handle the Doltgres extended string type.
+var GetNonlocalTablesNameColumn = getNonlocalTablesNameColumn
+
+func getNonlocalTablesNameColumn(_ context.Context, keyDesc *val.TupleDesc, keyTuple val.Tuple) (string, error) {
+	key, ok := keyDesc.GetString(0, keyTuple)
+	if !ok {
+		return "", fmt.Errorf("failed to read global table")
+	}
+	return key, nil
+}
+
+type NonlocalTableEntry struct {
+	Ref          string
+	NewTableName string
+	Options      string
+}
+
+func getNonlocalTablesRef(_ context.Context, valDesc *val.TupleDesc, valTuple val.Tuple) (result NonlocalTableEntry) {
+	result.Ref, _ = valDesc.GetString(0, valTuple)
+	result.NewTableName, _ = valDesc.GetString(1, valTuple)
+	result.Options, _ = valDesc.GetString(2, valTuple)
+	return result
+}
+
+// GetNonlocalTablePatterns invokes |cb| once for each table name pattern in dolt_nonlocal_tables on |root| and |schema|.
+func GetNonlocalTablePatterns(ctx context.Context, root RootValue, schema string, cb func(string)) error {
+	table_name := TableName{Name: NonlocalTableName, Schema: schema}
+	table, found, err := root.GetTable(ctx, table_name)
+	if err != nil {
+		return err
+	}
+	if !found {
+		// dolt_global_tables doesn't exist, so don't filter any tables.
+		return nil
+	}
+
+	index, err := table.GetRowData(ctx)
+	if err != nil {
+		return err
+	}
+	ignoreTableSchema, err := table.GetSchema(ctx)
+	if err != nil {
+		return err
+	}
+	m := durable.MapFromIndex(index)
+	keyDesc, _ := ignoreTableSchema.GetMapDescriptors(m.NodeStore())
+
+	ignoreTableMap, err := m.IterAll(ctx)
+	if err != nil {
+		return err
+	}
+	for {
+		keyTuple, _, err := ignoreTableMap.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		globalTableName, err := GetNonlocalTablesNameColumn(ctx, keyDesc, keyTuple)
+		if err != nil {
+			return err
+		}
+
+		cb(globalTableName)
+	}
+	return nil
+}

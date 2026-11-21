@@ -1,0 +1,112 @@
+#!/usr/bin/expect
+
+set timeout 2
+spawn dolt sql
+expect {
+  "> " { send "CREATE TABLE test(pk BIGINT PRIMARY KEY, v1 BIGINT);\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "> " { send "INSERT INTO test VALUES (0,0);\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "> " { send "DELIMITER $$\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "> " { send "INSERT INTO test VALUES (1,1)$$\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "> " { send "delimiter #\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "> " { send "CREATE TRIGGER tt BEFORE INSERT ON test FOR EACH ROW\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "      -> " { send "BEGIN\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "      -> " { send "SET NEW.v1 = NEW.v1 * 11;\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "      -> " { send "SET NEW.v1 = NEW.v1 * -10;\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "      -> " { send "END; #\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+
+# https://github.com/dolthub/dolt/issues/10841
+# line comment preceding setting delimiter should not be an issue
+expect {
+  "> " { send -- "-- comment\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "> " { send "DELIMITER //\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "> " { send "select null //\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+# delimiter statement in the middle of a undelimited statement should not set the delimiter
+expect {
+  "> " { send "select\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect {
+  "      -> " { send "delimiter $$\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+# previous line should not be delimited. delimit here and expect an error
+expect {
+  "*> " {
+    send "//\r"
+  }
+  timeout { exit 1 }
+}
+
+expect {
+  -re "error|syntax error|Error" { }
+  timeout {
+    puts "expected error not found"
+    exit 1
+  }
+}
+
+# make sure delimiter is still //
+expect {
+  "> " { send "select null //\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+
+expect {
+  "> " { send "DeLiMiTeR ;\r"; }
+  timeout { exit 1; }
+  failed { exit 1; }
+}
+expect eof

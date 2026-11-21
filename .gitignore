@@ -1,0 +1,32 @@
+**/.idea/
+**/.dolt/
+.vscode
+.run
+venv
+
+.DS_Store
+.sqlhistory
+.doltcfg
+test.sh
+*eventsapi@*
+
+# ignore cp'd sysbench runner testing files
+SysbenchDockerfile
+SysbenchDockerfile.dockerignore
+sysbench-runner-tests-entrypoint.sh
+config.json
+integration-tests/bats/batsee_results
+
+# ignore CLAUDE.md for now
+CLAUDE.md
+
+*~
+.dir-locals.el
+.beads
+.gitattributes
+
+.de/
+.cursor
+AGENTS.md
+.claude/
+.cursorrules
